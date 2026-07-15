@@ -16,8 +16,8 @@
 // The server consumes bin/fm-fleet-snapshot.sh's read-only v1 contract in a
 // bounded child process. It always supplies one canonical FM_HOME explicitly,
 // removes ambient operational-directory overrides, validates the snapshot's
-// home identity, and exposes only a redacted whitelist. A failed refresh ages
-// to Unknown/stale and expires instead of serving cached truth indefinitely.
+// home identity, and exposes only a redacted whitelist. A failed refresh keeps
+// last-known-good identities visible while suppressing stale operational truth.
 
 import childProcess from 'node:child_process';
 import crypto from 'node:crypto';
@@ -441,6 +441,8 @@ const HTML = String.raw`<!doctype html>
     .home-code { color:var(--faint); font:10px/1.3 ui-monospace, SFMono-Regular, Menlo, monospace; }
     .home-warning { max-width:760px; color:var(--amber); font-size:11px; line-height:1.4; text-align:right; overflow-wrap:anywhere; }
     .home-warning[hidden] { display:none; }
+    .fleet-alert { padding:10px 12px; border-bottom:1px solid color-mix(in srgb, var(--red) 58%, var(--line)); background:#171011; color:#f2b0b0; font-size:12px; font-weight:560; line-height:1.4; overflow-wrap:anywhere; }
+    .fleet-alert[hidden] { display:none; }
     .summary { display:grid; grid-template-columns:repeat(7, minmax(0, 1fr)); border-bottom:1px solid var(--line); }
     .metric { min-width:0; padding:18px 16px 16px; border-right:1px solid var(--line); }
     .metric:first-child { padding-left:0; }
@@ -540,6 +542,7 @@ const HTML = String.raw`<!doctype html>
       <div class="home-name"><span>Operational home</span><strong id="home-label">Resolving…</strong><code id="home-code"></code></div>
       <div id="home-warning" class="home-warning" role="status" hidden></div>
     </section>
+    <div id="fleet-alert" class="fleet-alert" role="status" aria-live="polite" hidden></div>
     <section id="summary" class="summary" aria-label="Fleet summary"></section>
     <section id="captain-panel" class="captain-panel" hidden>
       <div class="section-head"><h2>Needs Captain</h2><span id="decision-count"></span></div>
@@ -580,6 +583,11 @@ const HTML = String.raw`<!doctype html>
       if (seconds < 3600) return Math.floor(seconds / 60) + 'm';
       if (seconds < 86400) return Math.floor(seconds / 3600) + 'h ' + Math.floor((seconds % 3600) / 60) + 'm';
       return Math.floor(seconds / 86400) + 'd ' + Math.floor((seconds % 86400) / 3600) + 'h';
+    }
+    function formatRefreshAge(seconds) {
+      if (!Number.isFinite(seconds)) return 'not yet';
+      if (seconds < 60) return Math.floor(seconds) + 's ago';
+      return formatDuration(seconds) + ' ago';
     }
     function safeHref(value) {
       try {
@@ -664,8 +672,23 @@ const HTML = String.raw`<!doctype html>
       document.getElementById('home-id').textContent = 'Home ' + (home.label || '—') + (home.id ? ' · ' + home.id : '');
       const connection = payload.connection || { state: 'error' };
       connectionDot.className = 'connection-dot ' + connection.state;
-      const age = Number.isFinite(connection.age_seconds) ? formatDuration(connection.age_seconds) + ' ago' : 'not yet';
-      connectionText.textContent = connection.state === 'live' ? 'Live · refreshed ' + age : (connection.state === 'starting' ? 'Connecting…' : 'State ' + connection.state + ' · last good refresh ' + age);
+      const age = formatRefreshAge(connection.age_seconds);
+      const errorAge = formatRefreshAge(connection.error_age_seconds);
+      connectionText.textContent = connection.state === 'live'
+        ? 'Live · refreshed ' + age
+        : (connection.state === 'starting'
+          ? 'Connecting…'
+          : (connection.error
+            ? connection.error + ' · ' + errorAge + ' · showing last good from ' + age
+            : 'State ' + connection.state + ' · last good refresh ' + age));
+      const fleetAlert = document.getElementById('fleet-alert');
+      const degraded = connection.state === 'error' || connection.state === 'stale';
+      fleetAlert.hidden = !degraded;
+      fleetAlert.textContent = degraded
+        ? (connection.error
+          ? 'Snapshot refresh failed: ' + connection.error + ' (' + errorAge + '). Showing retained task identities from the last good refresh (' + age + '); operational states are marked unknown.'
+          : 'Fleet truth is stale. Showing retained task identities from the last good refresh (' + age + '); operational states are marked unknown.')
+        : '';
     }
     async function poll() {
       const controller = new AbortController();
@@ -727,7 +750,7 @@ function serve(config) {
   const refreshMs = parsePositiveInt(process.env.FM_DASHBOARD_REFRESH_MS, 2500, 500, 30000);
   const staleMs = parsePositiveInt(process.env.FM_DASHBOARD_STALE_MS, Math.max(12000, refreshMs * 4), refreshMs * 2, 300000);
   const expireMs = parsePositiveInt(process.env.FM_DASHBOARD_EXPIRE_MS, Math.max(60000, staleMs * 4), staleMs * 2, 900000);
-  const timeoutMs = parsePositiveInt(process.env.FM_DASHBOARD_SNAPSHOT_TIMEOUT_MS, 10000, 1000, 60000);
+  const timeoutMs = parsePositiveInt(process.env.FM_DASHBOARD_SNAPSHOT_TIMEOUT_MS, 30000, 1000, 60000);
   const maxBuffer = parsePositiveInt(process.env.FM_DASHBOARD_SNAPSHOT_MAX_BYTES, 2 * 1024 * 1024, 65536, 8 * 1024 * 1024);
   const idleMs = parsePositiveInt(process.env.FM_DASHBOARD_IDLE_MS, Math.max(30000, refreshMs * 6), refreshMs, 600000);
   const expectedHost = `${LOOPBACK}:${config.port}`;
@@ -735,9 +758,10 @@ function serve(config) {
   let stopped = false;
   let lastSuccess = 0;
   let lastError = null;
+  let lastErrorAt = 0;
   let projected = null;
   let activeChild = null;
-  let lastClientActivity = Date.now();
+  let lastClientActivity = 0;
 
   function refresh() {
     if (refreshing || stopped) return;
@@ -747,6 +771,7 @@ function serve(config) {
     Object.assign(environment, {
       FM_HOME: config.home,
       FM_CREW_STATE_NM_TIMEOUT: environment.FM_DASHBOARD_CREW_STATE_TIMEOUT || '1',
+      FM_SNAPSHOT_CREW_STATE_TIMEOUT: environment.FM_DASHBOARD_TASK_TIMEOUT || '2',
       FM_SNAPSHOT_SECONDMATE_TIMEOUT: environment.FM_DASHBOARD_SECONDMATE_TIMEOUT || '2',
       FM_SNAPSHOT_SECONDMATE_MAX_BYTES: environment.FM_DASHBOARD_SECONDMATE_MAX_BYTES || '131072',
       FM_SNAPSHOT_TERMINAL_LINES: environment.FM_DASHBOARD_TERMINAL_LINES || '4',
@@ -768,6 +793,7 @@ function serve(config) {
       if (stopped) return;
       if (error) {
         lastError = error.killed ? 'snapshot timed out' : 'snapshot unavailable';
+        lastErrorAt = Date.now();
         return;
       }
       try {
@@ -775,8 +801,10 @@ function serve(config) {
         projected = projectSnapshot(snapshot, config.home, config.homeId, config.homeSelection);
         lastSuccess = Date.now();
         lastError = null;
+        lastErrorAt = 0;
       } catch {
         lastError = 'snapshot was invalid';
+        lastErrorAt = Date.now();
       }
     });
   }
@@ -785,39 +813,41 @@ function serve(config) {
     const now = Date.now();
     const age = lastSuccess ? Math.max(0, Math.floor((now - lastSuccess) / 1000)) : null;
     const ageMs = lastSuccess ? now - lastSuccess : Number.POSITIVE_INFINITY;
+    const errorAge = lastErrorAt ? Math.max(0, Math.floor((now - lastErrorAt) / 1000)) : null;
     if (!projected) {
       return {
         schema: 'fm-fleet-dashboard.v1',
         generated_at: new Date(now).toISOString(),
         home_id: config.homeId,
         home: homeIdentity(config.home, config.homeId, config.homeSelection),
-        connection: { state: lastError ? 'error' : 'starting', age_seconds: age, error: lastError },
+        connection: {
+          state: lastError ? 'error' : 'starting', age_seconds: age,
+          error: lastError, error_age_seconds: errorAge, refreshing,
+        },
         counts: countsFor([]),
         tasks: [],
       };
     }
-    if (ageMs >= expireMs) {
-      return {
-        ...projected,
-        generated_at: new Date(now).toISOString(),
-        connection: { state: 'error', age_seconds: age, error: lastError || 'snapshot expired' },
-        counts: countsFor([]),
-        tasks: [],
-      };
-    }
-    const stale = ageMs >= staleMs;
-    const tasks = stale ? projected.tasks.map((task) => ({
+    const expired = ageMs >= expireMs;
+    const stale = Boolean(lastError) || ageMs >= staleMs;
+    const tasks = stale ? sortTasks(projected.tasks.map((task) => ({
       ...task,
       state: {
-        key: 'unknown', label: STATE_LABELS.unknown, source: 'expired dashboard snapshot',
+        key: 'unknown', label: STATE_LABELS.unknown,
+        source: expired ? 'expired last-known-good snapshot' : 'stale last-known-good snapshot',
         detail: `Last reliable snapshot was ${age} seconds ago.`, stale: true,
       },
       decisions: [],
-    })) : projected.tasks;
+      links: [],
+      endpoint: { status: 'unknown' },
+    }))) : projected.tasks;
     return {
       ...projected,
       generated_at: new Date(now).toISOString(),
-      connection: { state: stale ? 'stale' : 'live', age_seconds: age, error: stale ? lastError : null },
+      connection: {
+        state: lastError ? 'error' : stale ? 'stale' : 'live', age_seconds: age,
+        error: lastError, error_age_seconds: errorAge, refreshing,
+      },
       counts: countsFor(tasks),
       tasks,
     };
@@ -856,8 +886,10 @@ function serve(config) {
       return;
     }
     if (pathname === '/api/v1/fleet') {
-      lastClientActivity = Date.now();
-      if (!refreshing && (!lastSuccess || Date.now() - lastSuccess >= refreshMs)) refresh();
+      const requestAt = Date.now();
+      const reconnecting = lastClientActivity === 0 || requestAt - lastClientActivity > idleMs;
+      lastClientActivity = requestAt;
+      if (!refreshing && (reconnecting || lastError || !lastSuccess || requestAt - lastSuccess >= refreshMs)) refresh();
       const body = JSON.stringify(responsePayload());
       response.writeHead(200, securityHeaders('application/json; charset=utf-8'));
       response.end(method === 'HEAD' ? undefined : body);
@@ -880,9 +912,9 @@ function serve(config) {
     process.stderr.write(`fm-dashboard-server: ${error.code === 'EADDRINUSE' ? 'port unavailable' : 'server failed'}\n`);
     process.exit(1);
   });
-  server.listen(config.port, LOOPBACK, () => refresh());
+  server.listen(config.port, LOOPBACK);
   const timer = setInterval(() => {
-    if (Date.now() - lastClientActivity > idleMs) return;
+    if (!lastClientActivity || Date.now() - lastClientActivity > idleMs) return;
     refresh();
   }, refreshMs);
   timer.unref();
