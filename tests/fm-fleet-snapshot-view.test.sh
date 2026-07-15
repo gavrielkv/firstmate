@@ -82,6 +82,8 @@ EOF
     "worktree=$home/projects/alpha-worktree" \
     "project=alpha" \
     "harness=codex" \
+    "model=gpt-test" \
+    "effort=xhigh" \
     "kind=ship" \
     "mode=ship" \
     "yolo=off" \
@@ -141,6 +143,8 @@ test_fixture_snapshot_json() {
     .tasks[] | select(.id == "ship-task")
     | .current_state.state == "working"
       and .current_state.source == "pane"
+      and .model == "gpt-test"
+      and .effort == "xhigh"
       and .pr.url == "https://github.com/kunchenguid/firstmate/pull/9"
       and .backlog.body_excerpt == "Preserve this detail for bearings."
       and .hints.pending_decision == false

@@ -30,14 +30,18 @@
 #                       MUTATING sweeps (legacy PR-check migration, secondmate
 #                       fast-forward, secondmate liveness, X-mode artifact writes, fleet sync) run only
 #                       when this session actually holds the lock.
-#   3. wake-drain     - mutates the durable wake queue, so it also only runs
+#   3. dashboard      - lock-owning sessions idempotently ensure the local
+#                       read-only Fleet Dashboard and print its stable URL.
+#                       The dashboard independently live-reads bounded fleet
+#                       state; this script never re-reads or feeds digest data.
+#   4. wake-drain     - mutates the durable wake queue, so it also only runs
 #                       when locked.
-#   4. context digest - data/projects.md, data/secondmates.md, data/captain.md,
+#   5. context digest - data/projects.md, data/secondmates.md, data/captain.md,
 #                       data/learnings.md: read-only, always safe, always runs.
-#   5. fleet digest   - data/backlog.md, every state/*.meta, a bounded
+#   6. fleet digest   - data/backlog.md, every state/*.meta, a bounded
 #                       state/*.status tail, state/.afk, and a cheap
 #                       per-task endpoint-liveness read: read-only, always runs.
-#   6. closing reminder - prints the context-specific watcher next step; this
+#   7. closing reminder - prints the context-specific watcher next step; this
 #                       script points back to the emitted harness supervision
 #                       block and deliberately never arms the watcher itself.
 #
@@ -60,7 +64,7 @@
 # tasks-axi and quota-axi tool checks, and tasks-axi availability - none of
 # which mutate shared state and all of which are safe to compute from a second
 # session.
-# Only the five mutating sweeps and the wake-queue drain are skipped.
+# Only the five mutating sweeps, dashboard ensure, and wake-queue drain are skipped.
 # The context and fleet-state digests
 # below are always read-only, so they run unconditionally in both modes.
 #
@@ -176,7 +180,26 @@ else
   printf '(silent - all good)\n'
 fi
 
-# --- 3. wake-drain -------------------------------------------------------
+# --- 3. fleet dashboard ---------------------------------------------------
+# The lifecycle wrapper is the only process owner. It starts no command from
+# browser input and serves no mutation routes. Starting is a state/ write, so a
+# lock-refused session skips it exactly like the bootstrap sweeps and wake drain.
+# The independent server process consumes fm-fleet-snapshot.sh and never asks the
+# primary agent or this digest to re-read files on its behalf.
+subsection "FLEET DASHBOARD"
+if [ "$READ_ONLY" -eq 1 ]; then
+  printf 'skipped (read-only session) - the lock-owning session owns dashboard lifecycle.\n'
+else
+  DASHBOARD_OUT=$(FM_HOME="$FM_HOME" "$SCRIPT_DIR/fm-dashboard.sh" ensure 2>&1)
+  DASHBOARD_RC=$?
+  if [ "$DASHBOARD_RC" -eq 0 ]; then
+    printf '%s\n' "$DASHBOARD_OUT"
+  else
+    printf 'dashboard: unavailable - %s\n' "$DASHBOARD_OUT"
+  fi
+fi
+
+# --- 4. wake-drain -------------------------------------------------------
 # Drained records are this turn's first work queue (AGENTS.md section 8); the
 # drain also runs fm-guard.sh internally on the locked path, so the
 # tangle/watcher-liveness banners land right here too, ahead of the bulk
@@ -200,7 +223,7 @@ else
   fi
 fi
 
-# --- 4. supervision operating instructions ----------------------------------
+# --- 5. supervision operating instructions ----------------------------------
 AFK_PRESENT=0
 [ -e "$STATE/.afk" ] && AFK_PRESENT=1
 X_MODE_PRESENT=0
@@ -225,14 +248,14 @@ fi
   --afk "$AFK_PRESENT" \
   --x-mode "$X_MODE_PRESENT"
 
-# --- 4. context digest -----------------------------------------------------
+# --- 6. context digest -----------------------------------------------------
 section "CONTEXT"
 print_file_or_absent "$DATA/projects.md" "data/projects.md"
 print_file_or_absent "$DATA/secondmates.md" "data/secondmates.md"
 print_file_or_absent "$DATA/captain.md" "data/captain.md"
 print_file_or_absent "$DATA/learnings.md" "data/learnings.md"
 
-# --- 5. fleet-state digest ---------------------------------------------
+# --- 7. fleet-state digest ---------------------------------------------
 section "FLEET STATE"
 print_file_or_absent "$DATA/backlog.md" "data/backlog.md"
 
@@ -286,7 +309,7 @@ else
   printf 'absent\n'
 fi
 
-# --- 6. closing reminder -----------------------------------------------
+# --- 8. closing reminder -----------------------------------------------
 section "NEXT STEP"
 if [ "$READ_ONLY" -eq 1 ]; then
   cat <<'EOF'
