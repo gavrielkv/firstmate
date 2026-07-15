@@ -41,7 +41,8 @@ make_home() {  # <name>
 }
 
 make_fakebin() {  # <home>
-  local home=$1 fakebin="$home/fakebin" real_find
+  local home=$1 fakebin real_find
+  fakebin="$home/fakebin"
   real_find=$(command -v find)
   mkdir -p "$fakebin"
   cat > "$fakebin/no-mistakes" <<'SH'
@@ -96,7 +97,8 @@ SH
 }
 
 write_fixture() {  # <home>
-  local home=$1 mate="$TMP_ROOT/$(basename "$1")-mate-home"
+  local home=$1 mate
+  mate="$TMP_ROOT/$(basename "$home")-mate-home"
   mkdir -p \
     "$home/projects/working" "$home/projects/needs" "$home/projects/ci" \
     "$home/projects/paused" "$home/projects/failed" "$home/projects/done" \
