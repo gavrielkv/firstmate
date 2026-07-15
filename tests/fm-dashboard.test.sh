@@ -3,8 +3,8 @@
 # Covers lifecycle and idempotent reuse, deterministic collision fallback,
 # explicit-home isolation regardless of cwd, visible inferred-home diagnostics,
 # state classification, secondmate standing-by state, bounded escaping/redaction,
-# GET-only HTTP behavior, idle-gated live polling, per-task timeout degradation,
-# retained last-known-good recovery, and teardown that refuses an ambiguous pid.
+# GET-only HTTP behavior, live polling updates, and teardown that refuses to
+# signal an ambiguous pid.
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -41,20 +41,11 @@ make_home() {  # <name>
 }
 
 make_fakebin() {  # <home>
-  local home=$1 fakebin real_find
-  fakebin="$home/fakebin"
-  real_find=$(command -v find)
+  local home=$1 fakebin="$home/fakebin"
   mkdir -p "$fakebin"
   cat > "$fakebin/no-mistakes" <<'SH'
 #!/usr/bin/env bash
 exit 0
-SH
-  cat > "$fakebin/find" <<SH
-#!/usr/bin/env bash
-if [ -e "\${FM_DASHBOARD_TEST_MODE:-}/snapshot-hang" ]; then
-  sleep 20
-fi
-exec "$real_find" "\$@"
 SH
   cat > "$fakebin/tmux" <<'SH'
 #!/usr/bin/env bash
@@ -73,12 +64,8 @@ case "${1:-}" in
     esac
     ;;
   capture-pane)
-    if [ -e "$FM_DASHBOARD_TEST_MODE/slow-all" ] || \
-       { [ -e "$FM_DASHBOARD_TEST_MODE/slow-task" ] && printf '%s' "$target" | grep -q 'slow-task'; }; then
-      sleep 8
-    fi
     case "$target" in
-      *working-task*|*ci-task*|*slow-task*) printf 'work in progress\nesc to interrupt\n' ;;
+      *working-task*|*ci-task*) printf 'work in progress\nesc to interrupt\n' ;;
       *needs-task*)
         if [ -e "$FM_DASHBOARD_TEST_MODE/needs-busy" ]; then
           printf 'work resumed\nesc to interrupt\n'
@@ -92,13 +79,12 @@ case "${1:-}" in
 esac
 exit 0
 SH
-  chmod +x "$fakebin/find" "$fakebin/no-mistakes" "$fakebin/tmux"
+  chmod +x "$fakebin/no-mistakes" "$fakebin/tmux"
   printf '%s\n' "$fakebin"
 }
 
 write_fixture() {  # <home>
-  local home=$1 mate
-  mate="$TMP_ROOT/$(basename "$home")-mate-home"
+  local home=$1 mate="$TMP_ROOT/$(basename "$1")-mate-home"
   mkdir -p \
     "$home/projects/working" "$home/projects/needs" "$home/projects/ci" \
     "$home/projects/paused" "$home/projects/failed" "$home/projects/done" \
@@ -217,12 +203,7 @@ wait_for_api() {  # <url> <jq-expression>
 start_fixture_dashboard() {  # <home> <fakebin> <base-port>
   local home=$1 fakebin=$2 port=$3
   PATH="$fakebin:$PATH" FM_HOME="$home" FM_DASHBOARD_PORT="$port" FM_DASHBOARD_PORT_SPAN=8 \
-    FM_DASHBOARD_REFRESH_MS="${FM_DASHBOARD_REFRESH_MS:-500}" \
-    FM_DASHBOARD_IDLE_MS="${FM_DASHBOARD_IDLE_MS:-30000}" \
-    FM_DASHBOARD_TASK_TIMEOUT="${FM_DASHBOARD_TASK_TIMEOUT:-2}" \
-    FM_DASHBOARD_SNAPSHOT_TIMEOUT_MS="${FM_DASHBOARD_SNAPSHOT_TIMEOUT_MS:-30000}" \
-    FM_DASHBOARD_STALE_MS="${FM_DASHBOARD_STALE_MS:-3000}" \
-    FM_DASHBOARD_EXPIRE_MS="${FM_DASHBOARD_EXPIRE_MS:-8000}" \
+    FM_DASHBOARD_REFRESH_MS=500 FM_DASHBOARD_STALE_MS=3000 FM_DASHBOARD_EXPIRE_MS=8000 \
     FM_DASHBOARD_TEST_MODE="$home" "$DASHBOARD" start
 }
 
@@ -234,8 +215,6 @@ test_help_and_internal_contract() {
   assert_contains "$help" "stop" "help omitted stop"
   assert_contains "$help" "open" "help omitted open"
   assert_contains "$help" "always binds 127.0.0.1" "help omitted loopback boundary"
-  assert_contains "$help" "FM_DASHBOARD_TASK_TIMEOUT" "help omitted per-task read bound"
-  assert_contains "$help" "FM_DASHBOARD_SNAPSHOT_TIMEOUT_MS" "help omitted whole-snapshot bound"
   node --check "$SERVER" || fail "dashboard server failed node syntax check"
   pass "dashboard help and internal server contract are available"
 }
@@ -300,7 +279,6 @@ test_lifecycle_projection_isolation_and_live_update() {
   assert_contains "$html" "FIRSTMATE" "dashboard HTML omitted product identity"
   assert_contains "$html" '<table class="fleet-table">' "shared-field records are not rendered as a semantic table"
   assert_contains "$html" '<th scope="col">Status</th>' "dashboard table omitted scoped column headers"
-  assert_contains "$html" 'id="fleet-alert"' "dashboard HTML omitted the prominent stale/error banner"
   assert_contains "$html" "textContent" "browser renderer is not using textContent"
   assert_not_contains "$html" "innerHTML" "browser renderer uses unsafe dynamic innerHTML"
   assert_not_contains "$html" "<img src=x onerror=alert(1)>" "fixture HTML was server-rendered without escaping"
@@ -375,118 +353,6 @@ NODE
   pass "port collision falls back deterministically and ambiguous teardown is safe"
 }
 
-test_slow_task_retained_cache_idle_reconnect_and_disabled_open() {
-  local home fakebin out url api baseline_total stale reconnect first_after_idle marker open_out
-  home=$(make_home five-task-real-home-regression)
-  mkdir -p "$home/projects/working" "$home/projects/needs" "$home/projects/ci" \
-    "$home/projects/paused" "$home/projects/slow"
-  cat > "$home/data/backlog.md" <<'EOF'
-## In flight
-- [ ] needs-task - Choose fixture behavior (repo: alpha) (kind: ship) (since 2026-07-15)
-- [ ] working-task - Build the dashboard (repo: alpha) (kind: ship) (since 2026-07-15)
-- [ ] ci-task - Validate dashboard CI (repo: alpha) (kind: ship) (since 2026-07-15)
-- [ ] paused-task - Wait for upstream release (repo: beta) (kind: scout) (since 2026-07-15)
-- [ ] slow-task - Exercise bounded task reads (repo: alpha) (kind: ship) (since 2026-07-15)
-
-## Queued
-
-## Done
-EOF
-  fm_write_meta "$home/state/needs-task.meta" \
-    "window=firstmate:fm-needs-task" "worktree=$home/projects/needs" "project=alpha" \
-    "harness=codex" "model=default" "effort=high" "kind=ship" "mode=no-mistakes"
-  printf 'needs-decision [key=choice]: choose A or B\n' > "$home/state/needs-task.status"
-  fm_write_meta "$home/state/working-task.meta" \
-    "window=firstmate:fm-working-task" "worktree=$home/projects/working" "project=alpha" \
-    "harness=codex" "model=default" "effort=high" "kind=ship" "mode=no-mistakes"
-  printf 'working: healthy sibling task\n' > "$home/state/working-task.status"
-  fm_write_meta "$home/state/ci-task.meta" \
-    "window=firstmate:fm-ci-task" "worktree=$home/projects/ci" "project=alpha" \
-    "harness=claude" "model=default" "effort=high" "kind=ship" "mode=no-mistakes"
-  printf 'working: CI checks running\n' > "$home/state/ci-task.status"
-  fm_write_meta "$home/state/paused-task.meta" \
-    "window=firstmate:fm-paused-task" "worktree=$home/projects/paused" "project=beta" \
-    "harness=pi" "model=default" "effort=medium" "kind=scout" "mode=scout"
-  printf 'paused: waiting for upstream release\n' > "$home/state/paused-task.status"
-  fm_write_meta "$home/state/slow-task.meta" \
-    "window=firstmate:fm-slow-task" "worktree=$home/projects/slow" "project=alpha" \
-    "harness=codex" "model=default" "effort=high" "kind=ship" "mode=no-mistakes"
-  printf 'working: bounded backend read fixture\n' > "$home/state/slow-task.status"
-  fakebin=$(make_fakebin "$home")
-  out=$(FM_DASHBOARD_IDLE_MS=1000 FM_DASHBOARD_TASK_TIMEOUT=1 \
-    FM_DASHBOARD_SNAPSHOT_TIMEOUT_MS=8000 FM_DASHBOARD_STALE_MS=1000 \
-    FM_DASHBOARD_EXPIRE_MS=2500 start_fixture_dashboard "$home" "$fakebin" "$((BASE_PORT + 60))") \
-    || fail "slow-task fixture dashboard start failed: $out"
-  url=${out##* }
-  LIVE_HOMES="$LIVE_HOMES $home"
-
-  api=$(wait_for_api "$url" '.connection.state == "live" and (.tasks | length) == 5') \
-    || fail "five-task-sized regression home did not become live"
-  baseline_total=$(printf '%s' "$api" | jq -r '.counts.total')
-  : > "$home/slow-task"
-  api=$(wait_for_api "$url" '
-    .connection.state == "live"
-      and (.tasks[] | select(.id == "slow-task") | .state.key == "unknown" and .state.source == "timeout")
-      and (.tasks[] | select(.id == "working-task") | .state.key == "working")') \
-    || fail "one slow task did not degrade independently while healthy siblings stayed live"
-  rm -f "$home/slow-task"
-  api=$(wait_for_api "$url" '(.tasks[] | select(.id == "slow-task") | .state.key == "working")') \
-    || fail "bounded slow task did not recover on a healthy refresh"
-
-  : > "$home/snapshot-hang"
-  stale=$(wait_for_api "$url" "
-    .connection.state == \"error\"
-      and .connection.error == \"snapshot timed out\"
-      and (.connection.error_age_seconds | type) == \"number\"
-      and .connection.age_seconds >= 2
-      and .counts.total == $baseline_total
-      and (.tasks | length) == $baseline_total
-      and ([.tasks[].state.key] | all(. == \"unknown\"))
-      and ([.tasks[].state.source] | all(. == \"expired last-known-good snapshot\"))
-      and ([.tasks[].decisions] | all(length == 0))
-      and ([.tasks[].links] | all(length == 0))") \
-    || fail "failed refresh blanked or trusted expired last-known-good task truth"
-  assert_contains "$stale" '"snapshot timed out"' "timeout error was not exposed"
-  rm -f "$home/snapshot-hang"
-  api=$(wait_for_api "$url" "
-    .connection.state == \"live\" and .connection.error == null
-      and .counts.total == $baseline_total
-      and (.tasks[] | select(.id == \"working-task\") | .state.key == \"working\")") \
-    || fail "dashboard did not immediately recover stale last-known-good truth"
-
-  sleep 1.7
-  mkdir -p "$home/projects/reconnect"
-  fm_write_meta "$home/state/reconnect-task.meta" \
-    "window=firstmate:fm-reconnect-task" "worktree=$home/projects/reconnect" "project=alpha" \
-    "harness=codex" "model=default" "effort=high" "kind=ship" "mode=no-mistakes"
-  printf 'working: appeared while the browser was away\n' > "$home/state/reconnect-task.status"
-  sleep 1.2
-  first_after_idle=$(http_get "$url/api/v1/fleet") || fail "idle reconnect request failed"
-  printf '%s' "$first_after_idle" | jq -e '([.tasks[].id] | index("reconnect-task")) == null' >/dev/null \
-    || fail "snapshot refresh did not idle after recent client activity expired"
-  reconnect=$(wait_for_api "$url" '(.tasks[] | select(.id == "reconnect-task") | .state.key == "working")') \
-    || fail "reconnect did not trigger an immediate fresh fleet snapshot"
-  printf '%s' "$reconnect" | jq -e '.connection.state == "live" and .connection.error == null' >/dev/null \
-    || fail "stale truth persisted after reconnect recovery"
-
-  marker="$home/open-called"
-  cat > "$fakebin/open" <<SH
-#!/usr/bin/env bash
-touch "$marker"
-SH
-  chmod +x "$fakebin/open"
-  open_out=$(PATH="$fakebin:$PATH" FM_HOME="$home" FM_DASHBOARD_DISABLE=1 "$DASHBOARD" open) \
-    || fail "disabled open command failed: $open_out"
-  assert_contains "$open_out" "disabled by FM_DASHBOARD_DISABLE" "disabled open omitted its diagnostic"
-  [ ! -e "$marker" ] || fail "open command launched a browser while dashboard start was disabled"
-
-  PATH="$fakebin:$PATH" FM_HOME="$home" "$DASHBOARD" stop >/dev/null \
-    || fail "slow-task fixture dashboard did not stop cleanly"
-  LIVE_HOMES=$(printf '%s' "$LIVE_HOMES" | sed "s# $home##")
-  pass "slow tasks degrade independently, last-known-good truth survives timeout, reconnect refreshes, and disabled open is inert"
-}
-
 test_help_and_internal_contract
 test_lifecycle_projection_isolation_and_live_update
 test_collision_fallback_and_safe_ambiguous_stop
-test_slow_task_retained_cache_idle_reconnect_and_disabled_open

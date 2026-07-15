@@ -55,11 +55,8 @@ Environment:
   FM_DASHBOARD_PORT_SPAN     ascending collision attempts (default 20)
   FM_DASHBOARD_DISABLE=1     skip automatic/manual start for troubleshooting
   FM_DASHBOARD_REFRESH_MS    server snapshot cadence (default 2500)
-  FM_DASHBOARD_IDLE_MS       idle span with no client polls before refresh pauses
-  FM_DASHBOARD_TASK_TIMEOUT  per-task current-state read bound (default 2s)
-  FM_DASHBOARD_SNAPSHOT_TIMEOUT_MS  whole-snapshot safety bound (default 30000)
   FM_DASHBOARD_STALE_MS      age before cached tasks become Unknown/stale
-  FM_DASHBOARD_EXPIRE_MS     age marking retained last-known-good rows expired
+  FM_DASHBOARD_EXPIRE_MS     age before cached task rows disappear
 
 The server always binds 127.0.0.1 and exposes GET/HEAD only. Runtime artifacts
 live under FM_HOME/state and are never tracked.
@@ -289,10 +286,6 @@ open_dashboard() {
   out=$(start_dashboard) || return 1
   printf '%s\n' "$out"
   url=${out##* }
-  case "$url" in
-    http://127.0.0.1:*) ;;
-    *) return 0 ;;
-  esac
   case "$(uname -s 2>/dev/null || true)" in
     Darwin) command -v open >/dev/null 2>&1 || die "open command not found"; open "$url" ;;
     *) command -v xdg-open >/dev/null 2>&1 || die "xdg-open command not found"; xdg-open "$url" ;;

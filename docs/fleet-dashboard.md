@@ -36,13 +36,9 @@ An unresolved keyed `needs-decision` event takes precedence and pins the task to
 Secondmate rows use validated structured state from the registered secondmate home when available, with the parent event remaining historical evidence only.
 Recent structured `Done` backlog entries stay visible after their direct-report metadata is safely torn down.
 
-The browser polls every three seconds while it is open.
-The server pauses expensive fleet snapshots after a bounded span with no API client activity and starts a refresh immediately when a browser reconnects.
-Each task's current-state reconciliation has its own timeout, so one slow backend read degrades only that row to `Unknown / stale` instead of sinking the whole fleet refresh.
-
-If a whole refresh fails, the API retains the last-known-good task identities and total count, reports the exact bounded error and its age, and immediately marks every cached state `Unknown / stale`.
-Open decisions, links, and endpoint claims are suppressed while the cache is stale, so retained identities never masquerade as current operational truth.
-The rows remain visible after the long-stale threshold instead of collapsing to an empty fleet, and the next successful refresh atomically replaces them with fresh truth.
+The browser polls every three seconds while the server refreshes the read-only snapshot on its own cadence.
+If refreshes fail, cached active states age to `Unknown / stale` and open decisions are suppressed until truth is fresh again.
+If the failure continues, cached rows expire entirely instead of remaining stale indefinitely.
 
 ## Data safety
 
