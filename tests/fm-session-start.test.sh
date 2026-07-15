@@ -18,6 +18,8 @@
 #   - composition: the script invokes the real fm-lock.sh/fm-bootstrap.sh/
 #     fm-wake-drain.sh (their real, distinctive output appears verbatim), it
 #     does not reimplement their logic
+#   - lock-owning dashboard startup and same-home URL reuse, with read-only
+#     sessions skipping lifecycle mutation
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -29,6 +31,15 @@ SESSION_START="$ROOT/bin/fm-session-start.sh"
 BASE_PATH=${FM_TEST_BASE_PATH:-/usr/bin:/bin:/usr/sbin:/sbin}
 TMP_ROOT=$(fm_test_tmproot fm-session-start-tests)
 fm_git_identity fmtest fmtest@example.invalid
+SESSION_DASHBOARD_HOME=''
+
+cleanup_session_start_tests() {
+  if [ -n "$SESSION_DASHBOARD_HOME" ]; then
+    FM_HOME="$SESSION_DASHBOARD_HOME" "$ROOT/bin/fm-dashboard.sh" stop >/dev/null 2>&1 || true
+  fi
+  fm_test_cleanup
+}
+trap cleanup_session_start_tests EXIT
 
 # --- world builders ----------------------------------------------------------
 
@@ -194,8 +205,33 @@ SH
 run_session_start() {
   local home=$1 root=$2 path=$3
   env -u CLAUDECODE -u PI_CODING_AGENT -u GROK_AGENT \
-    FM_HOME="$home" FM_ROOT_OVERRIDE="$root" PATH="$path" \
+    FM_HOME="$home" FM_ROOT_OVERRIDE="$root" FM_DASHBOARD_DISABLE=1 PATH="$path" \
     "$SESSION_START"
+}
+
+run_session_start_with_dashboard() {
+  local home=$1 root=$2 path=$3 port=$4
+  env -u CLAUDECODE -u PI_CODING_AGENT -u GROK_AGENT \
+    FM_HOME="$home" FM_ROOT_OVERRIDE="$root" FM_DASHBOARD_PORT="$port" \
+    FM_DASHBOARD_PORT_SPAN=5 PATH="$path" "$SESSION_START"
+}
+
+dashboard_http_get() {
+  node - "$1" <<'NODE'
+const http = require('http');
+const url = new URL(process.argv[2]);
+const request = http.get(url, { timeout: 3000 }, (response) => {
+  let body = '';
+  response.setEncoding('utf8');
+  response.on('data', (chunk) => { body += chunk; });
+  response.on('end', () => {
+    if (response.statusCode !== 200) process.exitCode = 1;
+    process.stdout.write(body);
+  });
+});
+request.on('timeout', () => request.destroy());
+request.on('error', () => { process.exitCode = 1; });
+NODE
 }
 
 hash_file_for_test() {
@@ -311,6 +347,7 @@ EOF
   assert_contains "$out" "another live firstmate session holds the lock" "read-only banner did not surface fm-lock.sh's own error text"
   assert_contains "$out" "Skipping every mutating step" "read-only banner did not explain what was skipped"
   assert_contains "$out" "skipped (read-only session)" "wake-queue section did not report itself skipped"
+  assert_contains "$out" "the lock-owning session owns dashboard lifecycle" "read-only session did not skip dashboard lifecycle"
   assert_contains "$out" "WATCHER DOWN - SUPERVISION IS OFF" "read-only guard did not surface watcher-liveness alarm"
   assert_contains "$out" "queued wakes pending - left untouched for the session holding the fleet lock" "read-only guard did not leave queued wakes to the lock holder"
   assert_contains "$out" "TANGLE: primary checkout on feature branch 'fm/read-only-tangle'" "read-only bootstrap did not surface the tangle diagnostic"
@@ -740,6 +777,38 @@ EOF
   pass "session start rejects Pi loaded markers from previous sessions"
 }
 
+test_lock_owner_starts_dashboard_and_prints_url() {
+  local rec root home fakebin node_dir port out url expected_home_id health
+  rec=$(new_world dashboard-start)
+  IFS='|' read -r root home fakebin <<EOF
+$rec
+EOF
+  make_fake_toolchain "$fakebin"
+  make_fake_ps_claude "$fakebin"
+  rm -f "$fakebin/node"
+  node_dir=$(dirname "$(command -v node)")
+  port=$((54000 + ($$ % 1000)))
+  SESSION_DASHBOARD_HOME=$home
+
+  out=$(run_session_start_with_dashboard "$home" "$root" "$fakebin:$node_dir:$BASE_PATH" "$port")
+
+  assert_contains "$out" "FLEET DASHBOARD" "session start omitted the dashboard section"
+  assert_contains "$out" "dashboard: started http://127.0.0.1:" "lock-owning session did not start and print the dashboard URL"
+  url=$(printf '%s\n' "$out" | sed -n 's/^dashboard: started \(http:\/\/127\.0\.0\.1:[0-9][0-9]*\)$/\1/p' | head -1)
+  [ -n "$url" ] || fail "session-start dashboard URL was not parseable: $out"
+  expected_home_id=$(node "$ROOT/bin/fm-dashboard-server.mjs" --home-id "$home")
+  health=$(dashboard_http_get "$url/healthz") || fail "session-start dashboard health endpoint was unavailable"
+  assert_contains "$health" "\"home_id\":\"$expected_home_id\"" \
+    "session-start dashboard used the tool checkout instead of the operational FM_HOME"
+  FM_HOME="$home" FM_DASHBOARD_PORT="$port" "$ROOT/bin/fm-dashboard.sh" status >/dev/null \
+    || fail "session-start dashboard was not healthy after startup"
+  FM_HOME="$home" FM_DASHBOARD_PORT="$port" "$ROOT/bin/fm-dashboard.sh" stop >/dev/null \
+    || fail "session-start dashboard did not stop cleanly"
+  SESSION_DASHBOARD_HOME=''
+
+  pass "lock-owning session start ensures the operational-home Fleet Dashboard and prints its URL"
+}
+
 test_context_digest_absent_empty_present
 test_lock_refusal_read_only_path
 test_output_ordering_diagnostics_lead
@@ -757,3 +826,4 @@ test_pi_diagnostic_rejects_stale_loaded_marker
 test_pi_diagnostic_accepts_prelock_loaded_marker
 test_pi_diagnostic_rejects_missing_turnend_guard_marker
 test_pi_diagnostic_rejects_previous_session_loaded_marker
+test_lock_owner_starts_dashboard_and_prints_url
