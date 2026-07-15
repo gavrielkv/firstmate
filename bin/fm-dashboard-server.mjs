@@ -729,6 +729,7 @@ function serve(config) {
   const expireMs = parsePositiveInt(process.env.FM_DASHBOARD_EXPIRE_MS, Math.max(60000, staleMs * 4), staleMs * 2, 900000);
   const timeoutMs = parsePositiveInt(process.env.FM_DASHBOARD_SNAPSHOT_TIMEOUT_MS, 10000, 1000, 60000);
   const maxBuffer = parsePositiveInt(process.env.FM_DASHBOARD_SNAPSHOT_MAX_BYTES, 2 * 1024 * 1024, 65536, 8 * 1024 * 1024);
+  const idleMs = parsePositiveInt(process.env.FM_DASHBOARD_IDLE_MS, Math.max(30000, refreshMs * 6), refreshMs, 600000);
   const expectedHost = `${LOOPBACK}:${config.port}`;
   let refreshing = false;
   let stopped = false;
@@ -736,6 +737,7 @@ function serve(config) {
   let lastError = null;
   let projected = null;
   let activeChild = null;
+  let lastClientActivity = Date.now();
 
   function refresh() {
     if (refreshing || stopped) return;
@@ -854,6 +856,8 @@ function serve(config) {
       return;
     }
     if (pathname === '/api/v1/fleet') {
+      lastClientActivity = Date.now();
+      if (!refreshing && (!lastSuccess || Date.now() - lastSuccess >= refreshMs)) refresh();
       const body = JSON.stringify(responsePayload());
       response.writeHead(200, securityHeaders('application/json; charset=utf-8'));
       response.end(method === 'HEAD' ? undefined : body);
@@ -877,7 +881,10 @@ function serve(config) {
     process.exit(1);
   });
   server.listen(config.port, LOOPBACK, () => refresh());
-  const timer = setInterval(refresh, refreshMs);
+  const timer = setInterval(() => {
+    if (Date.now() - lastClientActivity > idleMs) return;
+    refresh();
+  }, refreshMs);
   timer.unref();
   process.on('SIGTERM', shutdown);
   process.on('SIGINT', shutdown);
