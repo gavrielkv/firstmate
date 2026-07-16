@@ -233,6 +233,7 @@ const STATE_LABELS = Object.freeze({
   blocked: 'Blocked / failed',
   merged_landed: 'Merged / landed',
   completed_report: 'Completed report',
+  completed_unverified: 'Completed · landing unverified',
   standby: 'Standing by',
   unknown: 'Unknown / stale',
 });
@@ -248,8 +249,7 @@ function lifecycleText(task) {
 
 function hasMergeEvidence(task) {
   return task.backlog?.completion?.verb === 'merged'
-    || Boolean(task.backlog?.merged)
-    || /\b(merged|landed)\b/i.test(lifecycleText(task));
+    || Boolean(task.backlog?.merged);
 }
 
 function shipStage(task, detail) {
@@ -296,7 +296,7 @@ function projectionDetail(task, mate, stateKey) {
       const child = mate.active_children?.[0];
       return child ? `${child.id}: ${child.doing || 'work in progress'}` : 'Routed work is in progress.';
     }
-    if (stateKey === 'waiting') return mate.holds?.[0]?.reason || 'Routed work is waiting on a known dependency.';
+    if (stateKey === 'paused_external') return mate.holds?.[0]?.reason || 'Routed work is waiting on a known dependency.';
     if (stateKey === 'standby') return 'No active routed work.';
     return mate.current?.reason || 'Structured secondmate state is unavailable.';
   }
@@ -376,6 +376,7 @@ function projectTask(task, snapshot, home, now) {
     },
     recently_landed: false,
     recently_completed_report: stateKey === 'completed_report',
+    recently_completed_unverified: false,
   };
 }
 
@@ -424,6 +425,7 @@ function projectMergedDelivery(record, liveIds, now) {
     endpoint: { status: 'not_applicable' },
     recently_landed: true,
     recently_completed_report: false,
+    recently_completed_unverified: false,
   };
 }
 
@@ -455,6 +457,44 @@ function projectCompletedReport(record, liveIds, now) {
     endpoint: { status: 'not_applicable' },
     recently_landed: false,
     recently_completed_report: true,
+    recently_completed_unverified: false,
+  };
+}
+
+function projectCompletedUnverified(record, liveIds, now) {
+  const id = safeId(record.id);
+  if (!id || liveIds.has(id) || !record.structured || record.state !== 'done') return null;
+  const isReport = record.kind === 'scout' || record.completion?.verb === 'reported' || Boolean(record.report_path);
+  if (isReport || landedDelivery(record)) return null;
+  const completed = parseDate(record.completion?.date || record.done);
+  const links = uniqueLinks([
+    safeLink(record.pr_url),
+    ...(record.links || []).map((url) => safeLink(url)),
+  ]);
+  return {
+    id,
+    title: redactText(record.title || id, 140),
+    project: safeProjectName(record.repo || 'unknown'),
+    kind: ['ship', 'scout'].includes(record.kind) ? record.kind : 'work',
+    harness: '',
+    model: '',
+    effort: '',
+    backend: '',
+    age_seconds: secondsSince(completed, now),
+    updated_at: Number.isFinite(completed) ? new Date(completed).toISOString() : null,
+    state: {
+      key: 'completed_unverified',
+      label: STATE_LABELS.completed_unverified,
+      source: 'backlog',
+      detail: redactText(`done ${record.completion?.date || ''} · no merge or landing evidence`.trim(), 120),
+      stale: false,
+    },
+    decisions: [],
+    links,
+    endpoint: { status: 'not_applicable' },
+    recently_landed: false,
+    recently_completed_report: false,
+    recently_completed_unverified: true,
   };
 }
 
@@ -463,6 +503,7 @@ function sortTasks(tasks) {
     waiting_for_captain: 0, blocked: 1, working: 2, validation_running: 3,
     pr_open_ci_pending: 4, ready_for_captain_merge: 5, committed: 6,
     paused_external: 7, standby: 8, unknown: 9, merged_landed: 10, completed_report: 11,
+    completed_unverified: 12,
   };
   return tasks.sort((left, right) => {
     const stateOrder = (rank[left.state.key] ?? 99) - (rank[right.state.key] ?? 99);
@@ -477,7 +518,7 @@ function countsFor(tasks) {
     total: tasks.length, waiting_for_captain: 0, working: 0, validation_running: 0,
     pr_open_ci_pending: 0, ready_for_captain_merge: 0, committed: 0,
     paused_external: 0, blocked: 0, merged_landed: 0, completed_report: 0,
-    standby: 0, unknown: 0,
+    completed_unverified: 0, standby: 0, unknown: 0,
   };
   for (const task of tasks) counts[task.state.key] = (counts[task.state.key] || 0) + 1;
   return counts;
@@ -496,7 +537,10 @@ function projectSnapshot(snapshot, home, id, selection, now = Date.now()) {
   const reports = backlogFile.safe
     ? (snapshot.backlog?.records || []).map((record) => projectCompletedReport(record, reportLiveIds, now)).filter(Boolean).slice(0, 12)
     : [];
-  const tasks = sortTasks([...live, ...merged, ...reports]);
+  const completed = backlogFile.safe
+    ? (snapshot.backlog?.records || []).map((record) => projectCompletedUnverified(record, liveIds, now)).filter(Boolean).slice(0, 12)
+    : [];
+  const tasks = sortTasks([...live, ...merged, ...reports, ...completed]);
   return {
     schema: 'fm-fleet-dashboard.v1',
     generated_at: new Date(now).toISOString(),
@@ -505,6 +549,7 @@ function projectSnapshot(snapshot, home, id, selection, now = Date.now()) {
     counts: countsFor(tasks),
     tasks,
     recent_reports: sortTasks(tasks.filter((task) => task.recently_completed_report)),
+    recent_completed: sortTasks(tasks.filter((task) => task.recently_completed_unverified)),
     recent_landed: sortTasks(tasks.filter((task) => task.recently_landed)),
   };
 }
@@ -554,6 +599,7 @@ const HTML = String.raw`<!doctype html>
     .metric[data-state="working"] .metric-value, .metric[data-state="validation_running"] .metric-value, .metric[data-state="pr_open_ci_pending"] .metric-value { color:var(--blue); }
     .metric[data-state="ready_for_captain_merge"] .metric-value, .metric[data-state="committed"] .metric-value { color:var(--violet); }
     .metric[data-state="merged_landed"] .metric-value, .metric[data-state="completed_report"] .metric-value { color:var(--green); }
+    .metric[data-state="completed_unverified"] .metric-value { color:var(--muted); }
     .captain-panel { margin-top:22px; border:1px solid color-mix(in srgb, var(--amber) 52%, var(--line)); background:#15130f; }
     .captain-panel[hidden] { display:none; }
     .section-head { min-width:0; min-height:43px; display:flex; align-items:center; justify-content:space-between; gap:16px; padding:0 14px; border-bottom:1px solid var(--line); overflow:hidden; }
@@ -584,6 +630,7 @@ const HTML = String.raw`<!doctype html>
     .state.blocked { color:var(--red); } .state.blocked .state-dot { background:var(--red); }
     .state.merged_landed, .state.completed_report { color:var(--green); } .state.merged_landed .state-dot, .state.completed_report .state-dot { background:var(--green); }
     .state.standby { color:var(--violet); } .state.standby .state-dot { background:var(--violet); }
+    .state.completed_unverified { color:var(--muted); } .state.completed_unverified .state-dot { background:var(--muted); }
     .task-title { font-size:14px; font-weight:650; line-height:1.35; overflow-wrap:anywhere; }
     .task-id, .secondary, .source { margin-top:5px; color:var(--muted); font-size:11px; line-height:1.4; overflow-wrap:anywhere; }
     .task-id, .runtime, .elapsed { font-family:ui-monospace, SFMono-Regular, Menlo, monospace; }
@@ -665,7 +712,7 @@ const HTML = String.raw`<!doctype html>
         </table>
       </section>
       <section id="recent-reports-section" hidden>
-        <div class="section-head"><h2>Recent reports / completed</h2><span>Completed scouts and report-backed work remain visible after teardown</span></div>
+        <div class="section-head"><h2>Recent reports / completed</h2><span>Completed scouts, report-backed work, and done records without merge evidence remain visible after teardown</span></div>
         <table class="fleet-table">
           <caption>Recent completed reports</caption>
           <colgroup><col class="col-status"><col class="col-task"><col class="col-project"><col class="col-runtime"><col class="col-elapsed"><col class="col-update"><col class="col-links"></colgroup>
@@ -682,7 +729,8 @@ const HTML = String.raw`<!doctype html>
       ['waiting_for_captain', 'Waiting for captain'], ['working', 'Working'], ['validation_running', 'Validation'],
       ['pr_open_ci_pending', 'PR / CI pending'], ['ready_for_captain_merge', 'Ready to merge'], ['committed', 'Committed'],
       ['paused_external', 'Paused / external'], ['blocked', 'Blocked'], ['merged_landed', 'Merged / landed'],
-      ['completed_report', 'Completed reports'], ['standby', 'Standing by'], ['unknown', 'Unknown / stale']
+      ['completed_report', 'Completed reports'], ['completed_unverified', 'Completed · unverified'],
+      ['standby', 'Standing by'], ['unknown', 'Unknown / stale']
     ];
     const tasksRoot = document.getElementById('tasks');
     const recentLandedRoot = document.getElementById('recent-landed');
@@ -784,14 +832,16 @@ const HTML = String.raw`<!doctype html>
     function render(payload) {
       renderSummary(payload.counts || {});
       renderDecisions(payload.tasks || []);
-      const active = (payload.tasks || []).filter((task) => !task.recently_landed && !task.recently_completed_report);
+      const active = (payload.tasks || []).filter((task) => !task.recently_landed && !task.recently_completed_report && !task.recently_completed_unverified);
       const landed = payload.recent_landed || (payload.tasks || []).filter((task) => task.recently_landed);
       const reports = payload.recent_reports || (payload.tasks || []).filter((task) => task.recently_completed_report);
+      const completed = payload.recent_completed || (payload.tasks || []).filter((task) => task.recently_completed_unverified);
+      const recentCompleted = [...reports, ...completed];
       renderRows(tasksRoot, active, 'No active direct reports or delivery handoffs.');
       document.getElementById('recent-landed-section').hidden = landed.length === 0;
-      document.getElementById('recent-reports-section').hidden = reports.length === 0;
+      document.getElementById('recent-reports-section').hidden = recentCompleted.length === 0;
       renderRows(recentLandedRoot, landed, 'No recent merged or landed work.');
-      renderRows(recentReportsRoot, reports, 'No recent completed reports.');
+      renderRows(recentReportsRoot, recentCompleted, 'No recent completed reports.');
       const home = payload.home || { label: 'Unknown home', id: payload.home_id || '—', diagnostic: 'Dashboard home identity is unavailable.' };
       document.getElementById('home-label').textContent = home.label || 'Unknown home';
       document.getElementById('home-code').textContent = home.id ? '· ' + home.id : '';

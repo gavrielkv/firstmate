@@ -351,11 +351,12 @@ test_truthful_lifecycle_incidents() {
   home=$(make_home truthful-lifecycle-incidents)
   mkdir -p "$home/projects/onboarding" "$home/projects/shadow" "$home/projects/validation" \
     "$home/projects/pr" "$home/projects/ready" "$home/projects/blocked" "$home/projects/paused" \
-    "$home/projects/eating" "$home/data/eating-reorder-readonly-diagnostic-f6"
+    "$home/projects/negated" "$home/projects/eating" "$home/data/eating-reorder-readonly-diagnostic-f6"
   cat > "$home/data/backlog.md" <<'EOF'
 ## In flight
 - [ ] implement-app-onboarding-completion-m4 - Onboarding completion review (repo: mochi-customer-support) (kind: ship) (since 2026-07-16)
 - [ ] add-shadow-lifecycle-client-a2 - Shadow lifecycle client (repo: mochi-customer-support) (kind: ship) (since 2026-07-16)
+- [ ] negated-merge-phrasing - Not-yet-merged handoff (repo: firstmate) (kind: ship) (since 2026-07-16)
 - [ ] validation-running - Validate lifecycle change (repo: firstmate) (kind: ship) (since 2026-07-16)
 - [ ] pr-open-ci-pending - Await CI (repo: firstmate) (kind: ship) (since 2026-07-16)
 - [ ] ready-captain-merge - Await captain merge (repo: firstmate) (kind: ship) (since 2026-07-16)
@@ -369,6 +370,7 @@ test_truthful_lifecycle_incidents() {
 - [x] eating-reorder-readonly-diagnostic-f6 - Read-only Eating Reorder diagnostic data/eating-reorder-readonly-diagnostic-f6/report.md (repo: eating-reorder-app) (kind: scout) (reported 2026-07-16)
 - [x] merged-lifecycle - Merged lifecycle change https://github.com/kunchenguid/firstmate/pull/987 (repo: firstmate) (kind: ship) (merged 2026-07-16)
 - [x] local-only-landed - Local-only landing local main (repo: firstmate) (kind: ship) (done 2026-07-16)
+- [x] bare-done-ship - Structured done ship without merge or landing evidence (repo: firstmate) (kind: ship) (done 2026-07-16)
 EOF
   printf '# completed diagnostic\n' > "$home/data/eating-reorder-readonly-diagnostic-f6/report.md"
   fm_write_meta "$home/state/implement-app-onboarding-completion-m4.meta" \
@@ -379,6 +381,10 @@ EOF
     "window=firstmate:fm-add-shadow-lifecycle-client-a2" "worktree=$home/projects/shadow" "project=mochi-customer-support" \
     "harness=codex" "kind=ship" "mode=no-mistakes"
   printf 'done: committed shadow-only lifecycle client with focused validation; awaiting no-mistakes PR handoff\n' > "$home/state/add-shadow-lifecycle-client-a2.status"
+  fm_write_meta "$home/state/negated-merge-phrasing.meta" \
+    "window=firstmate:fm-negated-merge-phrasing" "worktree=$home/projects/negated" "project=firstmate" \
+    "harness=codex" "kind=ship" "mode=no-mistakes"
+  printf 'done: implementation finished but not yet merged and still un-landed\n' > "$home/state/negated-merge-phrasing.status"
   fm_write_meta "$home/state/validation-running.meta" \
     "window=firstmate:fm-validation-running" "worktree=$home/projects/validation" "project=firstmate" \
     "harness=codex" "kind=ship" "mode=no-mistakes"
@@ -412,6 +418,7 @@ EOF
     .connection.state == "live"
       and (.tasks[] | select(.id == "implement-app-onboarding-completion-m4") | .state.key == "waiting_for_captain")
       and (.tasks[] | select(.id == "add-shadow-lifecycle-client-a2") | .state.key == "committed")
+      and (.tasks[] | select(.id == "negated-merge-phrasing") | .state.key == "committed")
       and (.tasks[] | select(.id == "validation-running") | .state.key == "validation_running")
       and (.tasks[] | select(.id == "pr-open-ci-pending") | .state.key == "pr_open_ci_pending")
       and (.tasks[] | select(.id == "ready-captain-merge") | .state.key == "ready_for_captain_merge")
@@ -420,12 +427,16 @@ EOF
       and (.tasks[] | select(.id == "eating-reorder-readonly-diagnostic-f6") | .state.key == "completed_report" and .recently_landed == false)
       and (.recent_landed[] | select(.id == "merged-lifecycle") | .state.key == "merged_landed")
       and (.recent_landed[] | select(.id == "local-only-landed") | .state.key == "merged_landed" and .recently_landed == true)
-      and ([.recent_reports[].id] | index("eating-reorder-readonly-diagnostic-f6"))') \
+      and ([.recent_reports[].id] | index("eating-reorder-readonly-diagnostic-f6"))
+      and (.recent_completed[] | select(.id == "bare-done-ship") | .state.key == "completed_unverified" and .recently_landed == false)
+      and ([.recent_landed[].id] | index("bare-done-ship") | not)') \
     || fail "truthful lifecycle classification did not cover the incident states"
   printf '%s' "$api" | jq -e '
     (.tasks[] | select(.id == "implement-app-onboarding-completion-m4") | .state.source == "pane")
       and (.tasks[] | select(.id == "add-shadow-lifecycle-client-a2") | .state.label != "Merged / landed")
+      and (.tasks[] | select(.id == "negated-merge-phrasing") | .state.label != "Merged / landed")
       and (.tasks[] | select(.id == "eating-reorder-readonly-diagnostic-f6") | .state.label != "Merged / landed")
+      and (.recent_completed[] | select(.id == "bare-done-ship") | .state.label != "Merged / landed")
       and (.recent_landed[] | select(.id == "merged-lifecycle") | .state.detail | test("^merged"))
       and (.recent_landed[] | select(.id == "local-only-landed") | .state.detail | test("^landed local main") and (test("merged") | not))
   ' >/dev/null || fail "explicit lifecycle status did not outrank stale runtime or terminology was inaccurate: $api"
@@ -441,6 +452,55 @@ EOF
     || fail "truthful lifecycle fixture dashboard did not stop cleanly"
   LIVE_HOMES=$(printf '%s' "$LIVE_HOMES" | sed "s# $home##")
   pass "dashboard preserves truthful lifecycle stages and completed reports"
+}
+
+test_paused_secondmate_hold_reason() {
+  local home mate fakebin out url api
+  home=$(make_home paused-secondmate-hold)
+  mate="$TMP_ROOT/paused-secondmate-hold-held-home"
+  mkdir -p "$mate/state" "$mate/data" "$mate/config" "$mate/projects/alpha" "$mate/bin"
+  printf '# Firstmate fixture\n' > "$mate/AGENTS.md"
+  printf 'held-mate\n' > "$mate/.fm-secondmate-home"
+  printf -- '- held-mate - Held domain (home: %s; scope: held work; projects: alpha; added 2026-07-15)\n' \
+    "$mate" > "$home/data/secondmates.md"
+  cat > "$mate/data/backlog.md" <<'EOF'
+## In flight
+
+## Queued
+- [ ] held-item - Await upstream release (repo: alpha) (kind: ship) (blocked-by: upstream - awaiting the upstream release window)
+
+## Done
+EOF
+  cat > "$home/data/backlog.md" <<'EOF'
+## In flight
+
+## Queued
+
+## Done
+EOF
+  fm_write_meta "$home/state/held-mate.meta" \
+    "window=firstmate:fm-held-mate" "worktree=$mate" "project=$mate" \
+    "harness=codex" "model=default" "effort=high" "kind=secondmate" "mode=secondmate" \
+    "home=$mate" "projects=alpha"
+  printf 'paused: routed subtask is externally held; the structured hold reason must surface\n' \
+    > "$home/state/held-mate.status"
+  fakebin=$(make_fakebin "$home")
+  out=$(start_fixture_dashboard "$home" "$fakebin" "$((BASE_PORT + 120))") \
+    || fail "paused secondmate fixture dashboard start failed: $out"
+  url=${out##* }
+  LIVE_HOMES="$LIVE_HOMES $home"
+  api=$(wait_for_api "$url" '
+    .connection.state == "live"
+      and (.tasks[] | select(.id == "held-mate") | .state.key == "paused_external")') \
+    || fail "externally held secondmate was not projected as paused/external"
+  printf '%s' "$api" | jq -e '
+    (.tasks[] | select(.id == "held-mate") | .state.detail | test("awaiting the upstream release window"))
+      and (.tasks[] | select(.id == "held-mate") | .state.detail | test("unavailable") | not)
+  ' >/dev/null || fail "paused secondmate detail dropped the known hold reason: $api"
+  PATH="$fakebin:$PATH" FM_HOME="$home" "$DASHBOARD" stop >/dev/null \
+    || fail "paused secondmate fixture dashboard did not stop cleanly"
+  LIVE_HOMES=$(printf '%s' "$LIVE_HOMES" | sed "s# $home##")
+  pass "externally held secondmate surfaces its known hold reason"
 }
 
 test_collision_fallback_and_safe_ambiguous_stop() {
@@ -590,5 +650,6 @@ SH
 test_help_and_internal_contract
 test_lifecycle_projection_isolation_and_live_update
 test_truthful_lifecycle_incidents
+test_paused_secondmate_hold_reason
 test_collision_fallback_and_safe_ambiguous_stop
 test_slow_task_retained_cache_idle_reconnect_and_disabled_open
