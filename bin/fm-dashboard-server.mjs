@@ -223,42 +223,80 @@ function uniqueLinks(links) {
 }
 
 const STATE_LABELS = Object.freeze({
-  needs_captain: 'Needs Captain',
+  waiting_for_captain: 'Waiting for captain',
   working: 'Working',
-  waiting: 'Waiting on CI / external',
+  validation_running: 'Validation running',
+  pr_open_ci_pending: 'PR open / CI pending',
+  ready_for_captain_merge: 'Ready for captain merge',
+  committed: 'Committed / handoff needed',
+  paused_external: 'Paused / external wait',
   blocked: 'Blocked / failed',
-  done: 'Done / landed',
+  merged_landed: 'Merged / landed',
+  completed_report: 'Completed report',
+  completed_unverified: 'Completed · landing unverified',
   standby: 'Standing by',
   unknown: 'Unknown / stale',
 });
 
+function lifecycleText(task) {
+  return [
+    task.paths?.status_log?.last_event?.note,
+    task.paths?.status_log?.last_event?.raw,
+    task.current_state?.detail,
+    task.hints?.last_event_text,
+  ].filter(Boolean).join(' ');
+}
+
+function hasMergeEvidence(task) {
+  return task.backlog?.completion?.verb === 'merged'
+    || Boolean(task.backlog?.merged);
+}
+
+function shipStage(task, detail) {
+  if (hasMergeEvidence(task)) return 'merged_landed';
+  if (/\b(checks? green|ready (?:for )?(?:captain )?merge|awaiting captain merge)\b/i.test(detail)) {
+    return 'ready_for_captain_merge';
+  }
+  if (task.pr?.url || /\b(?:pull request|\bpr\b).*(?:open|pending)|(?:ci|checks?).*(?:pending|running)\b/i.test(detail)) {
+    return 'pr_open_ci_pending';
+  }
+  return 'committed';
+}
+
 function classifyTask(task, mate, decisions) {
-  if (decisions.some((decision) => decision.verb === 'needs-decision')) return 'needs_captain';
+  const event = task.paths?.status_log?.last_event?.state || '';
+  const detail = lifecycleText(task);
   if (mate) {
-    if (mate.current?.state === 'captain_decision') return 'needs_captain';
+    if (mate.current?.state === 'captain_decision') return 'waiting_for_captain';
     if (mate.current?.state === 'active_child_work') return 'working';
-    if (mate.current?.state === 'externally_held') return 'waiting';
+    if (mate.current?.state === 'externally_held') return 'paused_external';
     if (mate.current?.state === 'no_active_work') return 'standby';
     return 'unknown';
   }
+  if (event === 'needs-decision' || decisions.some((decision) => decision.verb === 'needs-decision')) return 'waiting_for_captain';
+  if (event === 'blocked' || event === 'failed' || decisions.some((decision) => decision.verb === 'blocked')) return 'blocked';
+  if (event === 'paused') return 'paused_external';
+  if (event === 'done') return task.kind === 'scout' ? 'completed_report' : shipStage(task, detail);
   const current = task.current_state?.state || 'unknown';
-  const detail = `${task.current_state?.detail || ''} ${task.hints?.last_event_text || ''}`;
-  if (current === 'failed' || current === 'blocked' || decisions.some((decision) => decision.verb === 'blocked')) return 'blocked';
-  if (current === 'done') return 'done';
-  if (current === 'paused') return 'waiting';
-  if (current === 'working' && /\b(ci|external|rate.?limit|waiting|awaiting)\b/i.test(detail)) return 'waiting';
-  if (current === 'working' || current === 'parked') return 'working';
+  if (current === 'failed' || current === 'blocked') return 'blocked';
+  if (current === 'done') return task.kind === 'scout' ? 'completed_report' : shipStage(task, detail);
+  if (current === 'paused') return 'paused_external';
+  if (current === 'parked') return 'waiting_for_captain';
+  if (current === 'working' && /\b(no-mistakes|validation|validating|test(?:ing|s)?|lint(?:ing)?|review(?:ing)?|ci)\b/i.test(detail) && !task.pr?.url) return 'validation_running';
+  if (current === 'working' && (/\b(?:pull request|\bpr\b).*(?:open|pending)\b/i.test(detail)
+    || (Boolean(task.pr?.url) && /\b(?:ci|checks?).*(?:pending|running)\b/i.test(detail)))) return 'pr_open_ci_pending';
+  if (current === 'working') return 'working';
   return 'unknown';
 }
 
 function projectionDetail(task, mate, stateKey) {
   if (mate) {
-    if (stateKey === 'needs_captain') return mate.decisions_open?.[0]?.summary || 'A decision is required.';
+    if (stateKey === 'waiting_for_captain') return mate.decisions_open?.[0]?.summary || 'A captain decision is required.';
     if (stateKey === 'working') {
       const child = mate.active_children?.[0];
       return child ? `${child.id}: ${child.doing || 'work in progress'}` : 'Routed work is in progress.';
     }
-    if (stateKey === 'waiting') return mate.holds?.[0]?.reason || 'Routed work is waiting on a known dependency.';
+    if (stateKey === 'paused_external') return mate.holds?.[0]?.reason || 'Routed work is waiting on a known dependency.';
     if (stateKey === 'standby') return 'No active routed work.';
     return mate.current?.reason || 'Structured secondmate state is unavailable.';
   }
@@ -337,13 +375,98 @@ function projectTask(task, snapshot, home, now) {
           : 'unknown',
     },
     recently_landed: false,
+    recently_completed_report: stateKey === 'completed_report',
+    recently_completed_unverified: false,
   };
 }
 
-function projectLanded(record, liveIds, now) {
+function landedDelivery(record) {
+  if (record.completion?.verb === 'merged' || Boolean(record.merged)) {
+    return { verb: 'merged', date: record.completion?.date || record.merged, note: '' };
+  }
+  if (record.completion?.verb === 'done' && record.local_note) {
+    return { verb: 'landed', date: record.completion?.date || record.done, note: record.local_note };
+  }
+  return null;
+}
+
+function projectMergedDelivery(record, liveIds, now) {
+  const id = safeId(record.id);
+  const landed = landedDelivery(record);
+  if (!id || liveIds.has(id) || !record.structured || record.state !== 'done' || !landed) return null;
+  const completed = parseDate(landed.date || record.reported || record.done);
+  const links = uniqueLinks([
+    safeLink(record.pr_url),
+    ...(record.links || []).map((url) => safeLink(url)),
+  ]);
+  const detailText = landed.verb === 'merged'
+    ? `merged ${landed.date || ''}`
+    : `landed ${[landed.note, landed.date].filter(Boolean).join(' ')}`;
+  return {
+    id,
+    title: redactText(record.title || id, 140),
+    project: safeProjectName(record.repo || 'unknown'),
+    kind: ['ship', 'scout'].includes(record.kind) ? record.kind : 'work',
+    harness: '',
+    model: '',
+    effort: '',
+    backend: '',
+    age_seconds: secondsSince(completed, now),
+    updated_at: Number.isFinite(completed) ? new Date(completed).toISOString() : null,
+    state: {
+      key: 'merged_landed',
+      label: STATE_LABELS.merged_landed,
+      source: 'backlog',
+      detail: redactText(detailText.trim(), 120),
+      stale: false,
+    },
+    decisions: [],
+    links,
+    endpoint: { status: 'not_applicable' },
+    recently_landed: true,
+    recently_completed_report: false,
+    recently_completed_unverified: false,
+  };
+}
+
+function projectCompletedReport(record, liveIds, now) {
+  const id = safeId(record.id);
+  const isReport = record.kind === 'scout' || record.completion?.verb === 'reported' || Boolean(record.report_path);
+  if (!id || liveIds.has(id) || !record.structured || record.state !== 'done' || !isReport) return null;
+  const completed = parseDate(record.completion?.date || record.reported || record.done);
+  return {
+    id,
+    title: redactText(record.title || id, 140),
+    project: safeProjectName(record.repo || 'unknown'),
+    kind: ['ship', 'scout'].includes(record.kind) ? record.kind : 'work',
+    harness: '',
+    model: '',
+    effort: '',
+    backend: '',
+    age_seconds: secondsSince(completed, now),
+    updated_at: Number.isFinite(completed) ? new Date(completed).toISOString() : null,
+    state: {
+      key: 'completed_report',
+      label: STATE_LABELS.completed_report,
+      source: 'backlog',
+      detail: redactText(`reported ${record.completion?.date || ''}`.trim(), 120),
+      stale: false,
+    },
+    decisions: [],
+    links: [],
+    endpoint: { status: 'not_applicable' },
+    recently_landed: false,
+    recently_completed_report: true,
+    recently_completed_unverified: false,
+  };
+}
+
+function projectCompletedUnverified(record, liveIds, now) {
   const id = safeId(record.id);
   if (!id || liveIds.has(id) || !record.structured || record.state !== 'done') return null;
-  const completed = parseDate(record.completion?.date || record.merged || record.reported || record.done);
+  const isReport = record.kind === 'scout' || record.completion?.verb === 'reported' || Boolean(record.report_path);
+  if (isReport || landedDelivery(record)) return null;
+  const completed = parseDate(record.completion?.date || record.done);
   const links = uniqueLinks([
     safeLink(record.pr_url),
     ...(record.links || []).map((url) => safeLink(url)),
@@ -360,21 +483,28 @@ function projectLanded(record, liveIds, now) {
     age_seconds: secondsSince(completed, now),
     updated_at: Number.isFinite(completed) ? new Date(completed).toISOString() : null,
     state: {
-      key: 'done',
-      label: STATE_LABELS.done,
+      key: 'completed_unverified',
+      label: STATE_LABELS.completed_unverified,
       source: 'backlog',
-      detail: redactText(record.completion?.verb ? `${record.completion.verb} ${record.completion.date || ''}` : 'Landed.', 120),
+      detail: redactText(`done ${record.completion?.date || ''} · no merge or landing evidence`.trim(), 120),
       stale: false,
     },
     decisions: [],
     links,
     endpoint: { status: 'not_applicable' },
-    recently_landed: true,
+    recently_landed: false,
+    recently_completed_report: false,
+    recently_completed_unverified: true,
   };
 }
 
 function sortTasks(tasks) {
-  const rank = { needs_captain: 0, blocked: 1, working: 2, waiting: 3, standby: 4, unknown: 5, done: 6 };
+  const rank = {
+    waiting_for_captain: 0, blocked: 1, working: 2, validation_running: 3,
+    pr_open_ci_pending: 4, ready_for_captain_merge: 5, committed: 6,
+    paused_external: 7, standby: 8, unknown: 9, merged_landed: 10, completed_report: 11,
+    completed_unverified: 12,
+  };
   return tasks.sort((left, right) => {
     const stateOrder = (rank[left.state.key] ?? 99) - (rank[right.state.key] ?? 99);
     if (stateOrder !== 0) return stateOrder;
@@ -384,7 +514,12 @@ function sortTasks(tasks) {
 }
 
 function countsFor(tasks) {
-  const counts = { total: tasks.length, needs_captain: 0, working: 0, waiting: 0, blocked: 0, done: 0, standby: 0, unknown: 0 };
+  const counts = {
+    total: tasks.length, waiting_for_captain: 0, working: 0, validation_running: 0,
+    pr_open_ci_pending: 0, ready_for_captain_merge: 0, committed: 0,
+    paused_external: 0, blocked: 0, merged_landed: 0, completed_report: 0,
+    completed_unverified: 0, standby: 0, unknown: 0,
+  };
   for (const task of tasks) counts[task.state.key] = (counts[task.state.key] || 0) + 1;
   return counts;
 }
@@ -395,10 +530,17 @@ function projectSnapshot(snapshot, home, id, selection, now = Date.now()) {
   const backlogFile = scopedRegularFile(path.join(home, 'data'), 'backlog.md', true);
   const live = (snapshot.tasks || []).map((task) => projectTask(task, snapshot, home, now)).filter(Boolean);
   const liveIds = new Set(live.map((task) => task.id));
-  const landed = backlogFile.safe
-    ? (snapshot.backlog?.records || []).map((record) => projectLanded(record, liveIds, now)).filter(Boolean).slice(0, 10)
+  const merged = backlogFile.safe
+    ? (snapshot.backlog?.records || []).map((record) => projectMergedDelivery(record, liveIds, now)).filter(Boolean).slice(0, 12)
     : [];
-  const tasks = sortTasks([...live, ...landed]);
+  const reportLiveIds = new Set(live.filter((task) => task.recently_completed_report).map((task) => task.id));
+  const reports = backlogFile.safe
+    ? (snapshot.backlog?.records || []).map((record) => projectCompletedReport(record, reportLiveIds, now)).filter(Boolean).slice(0, 12)
+    : [];
+  const completed = backlogFile.safe
+    ? (snapshot.backlog?.records || []).map((record) => projectCompletedUnverified(record, liveIds, now)).filter(Boolean).slice(0, 12)
+    : [];
+  const tasks = sortTasks([...live, ...merged, ...reports, ...completed]);
   return {
     schema: 'fm-fleet-dashboard.v1',
     generated_at: new Date(now).toISOString(),
@@ -406,6 +548,9 @@ function projectSnapshot(snapshot, home, id, selection, now = Date.now()) {
     home: homeIdentity(home, id, selection),
     counts: countsFor(tasks),
     tasks,
+    recent_reports: sortTasks(tasks.filter((task) => task.recently_completed_report)),
+    recent_completed: sortTasks(tasks.filter((task) => task.recently_completed_unverified)),
+    recent_landed: sortTasks(tasks.filter((task) => task.recently_landed)),
   };
 }
 
@@ -443,17 +588,18 @@ const HTML = String.raw`<!doctype html>
     .home-warning[hidden] { display:none; }
     .fleet-alert { padding:10px 12px; border-bottom:1px solid color-mix(in srgb, var(--red) 58%, var(--line)); background:#171011; color:#f2b0b0; font-size:12px; font-weight:560; line-height:1.4; overflow-wrap:anywhere; }
     .fleet-alert[hidden] { display:none; }
-    .summary { display:grid; grid-template-columns:repeat(7, minmax(0, 1fr)); border-bottom:1px solid var(--line); }
+    .summary { display:grid; grid-template-columns:repeat(6, minmax(0, 1fr)); border-bottom:1px solid var(--line); }
     .metric { min-width:0; padding:18px 16px 16px; border-right:1px solid var(--line); }
     .metric:first-child { padding-left:0; }
     .metric:last-child { border-right:0; }
     .metric-value { display:block; font:600 24px/1 ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing:-.04em; }
     .metric-label { display:block; margin-top:8px; color:var(--muted); font-size:11px; letter-spacing:.065em; text-transform:uppercase; white-space:normal; }
-    .metric[data-state="needs_captain"] .metric-value { color:var(--amber); }
+    .metric[data-state="waiting_for_captain"] .metric-value, .metric[data-state="paused_external"] .metric-value { color:var(--amber); }
     .metric[data-state="blocked"] .metric-value { color:var(--red); }
-    .metric[data-state="working"] .metric-value { color:var(--blue); }
-    .metric[data-state="waiting"] .metric-value { color:var(--amber); }
-    .metric[data-state="done"] .metric-value { color:var(--green); }
+    .metric[data-state="working"] .metric-value, .metric[data-state="validation_running"] .metric-value, .metric[data-state="pr_open_ci_pending"] .metric-value { color:var(--blue); }
+    .metric[data-state="ready_for_captain_merge"] .metric-value, .metric[data-state="committed"] .metric-value { color:var(--violet); }
+    .metric[data-state="merged_landed"] .metric-value, .metric[data-state="completed_report"] .metric-value { color:var(--green); }
+    .metric[data-state="completed_unverified"] .metric-value { color:var(--muted); }
     .captain-panel { margin-top:22px; border:1px solid color-mix(in srgb, var(--amber) 52%, var(--line)); background:#15130f; }
     .captain-panel[hidden] { display:none; }
     .section-head { min-width:0; min-height:43px; display:flex; align-items:center; justify-content:space-between; gap:16px; padding:0 14px; border-bottom:1px solid var(--line); overflow:hidden; }
@@ -473,17 +619,18 @@ const HTML = String.raw`<!doctype html>
     .fleet-table th:first-child, .task-row > td:first-child { padding-left:0; }
     .task-row { background:var(--row); border-bottom:1px solid var(--line); transition:background-color 120ms ease; overflow:hidden; }
     .task-row:hover { background:#14181d; }
-    .task-row.needs_captain { box-shadow:inset 2px 0 0 var(--amber); }
+    .task-row.waiting_for_captain { box-shadow:inset 2px 0 0 var(--amber); }
     .task-row > td { min-width:0; padding:14px 12px; vertical-align:middle; overflow:hidden; }
     .task-row > td::before { display:none; }
     .state { display:flex; align-items:flex-start; gap:8px; font-size:11px; font-weight:650; line-height:1.35; text-transform:uppercase; letter-spacing:.055em; }
     .state-dot { width:7px; height:7px; margin-top:4px; border-radius:50%; background:var(--faint); flex:0 0 auto; }
-    .state.needs_captain { color:var(--amber); } .state.needs_captain .state-dot { background:var(--amber); }
-    .state.working { color:var(--blue); } .state.working .state-dot { background:var(--blue); }
-    .state.waiting { color:var(--amber); } .state.waiting .state-dot { background:var(--amber); }
+    .state.waiting_for_captain, .state.paused_external { color:var(--amber); } .state.waiting_for_captain .state-dot, .state.paused_external .state-dot { background:var(--amber); }
+    .state.working, .state.validation_running, .state.pr_open_ci_pending { color:var(--blue); } .state.working .state-dot, .state.validation_running .state-dot, .state.pr_open_ci_pending .state-dot { background:var(--blue); }
+    .state.ready_for_captain_merge, .state.committed { color:var(--violet); } .state.ready_for_captain_merge .state-dot, .state.committed .state-dot { background:var(--violet); }
     .state.blocked { color:var(--red); } .state.blocked .state-dot { background:var(--red); }
-    .state.done { color:var(--green); } .state.done .state-dot { background:var(--green); }
+    .state.merged_landed, .state.completed_report { color:var(--green); } .state.merged_landed .state-dot, .state.completed_report .state-dot { background:var(--green); }
     .state.standby { color:var(--violet); } .state.standby .state-dot { background:var(--violet); }
+    .state.completed_unverified { color:var(--muted); } .state.completed_unverified .state-dot { background:var(--muted); }
     .task-title { font-size:14px; font-weight:650; line-height:1.35; overflow-wrap:anywhere; }
     .task-id, .secondary, .source { margin-top:5px; color:var(--muted); font-size:11px; line-height:1.4; overflow-wrap:anywhere; }
     .task-id, .runtime, .elapsed { font-family:ui-monospace, SFMono-Regular, Menlo, monospace; }
@@ -496,9 +643,9 @@ const HTML = String.raw`<!doctype html>
     .empty { padding:56px 0; text-align:center; color:var(--muted); border-bottom:1px solid var(--line); }
     footer { display:flex; justify-content:space-between; gap:20px; padding-top:12px; color:var(--faint); font:10px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; }
     @media (max-width:1050px) {
-      .summary { grid-template-columns:repeat(4,minmax(0,1fr)); }
-      .metric:nth-child(4) { border-right:0; }
-      .metric:nth-child(n+5) { border-top:1px solid var(--line); }
+      .summary { grid-template-columns:repeat(3,minmax(0,1fr)); }
+      .metric:nth-child(3n) { border-right:0; }
+      .metric:nth-child(n+4) { border-top:1px solid var(--line); }
       .fleet-table th, .task-row > td { padding-left:9px; padding-right:9px; }
       .fleet-table th:first-child, .task-row > td:first-child { padding-left:0; }
       .fleet-table .col-status { width:15%; } .fleet-table .col-task { width:20%; } .fleet-table .col-project { width:13%; }
@@ -514,7 +661,6 @@ const HTML = String.raw`<!doctype html>
       .metric, .metric:first-child { padding:14px 10px 13px; border-right:1px solid var(--line); border-top:1px solid var(--line); }
       .metric:nth-child(2n) { border-right:0; }
       .metric:nth-child(-n+2) { border-top:0; }
-      .metric:last-child { grid-column:1 / -1; border-right:0; }
       .metric-value { font-size:21px; }
       main { border-top:0; }
       .fleet-table, .fleet-table tbody { display:block; width:100%; }
@@ -549,23 +695,46 @@ const HTML = String.raw`<!doctype html>
       <div id="decision-list" class="decision-list"></div>
     </section>
     <main>
-      <div class="section-head"><h2>Fleet activity</h2><span id="fleet-note">Live direct reports and recent landed work</span></div>
+      <div class="section-head"><h2>Fleet activity</h2><span id="fleet-note">Live direct reports and handoff stages</span></div>
       <table class="fleet-table">
-        <caption>Current Firstmate direct reports and recently landed work</caption>
+        <caption>Current Firstmate direct reports and delivery handoff state</caption>
         <colgroup><col class="col-status"><col class="col-task"><col class="col-project"><col class="col-runtime"><col class="col-elapsed"><col class="col-update"><col class="col-links"></colgroup>
         <thead><tr><th scope="col">Status</th><th scope="col">Task</th><th scope="col">Project / kind</th><th scope="col">Runtime</th><th scope="col">Elapsed</th><th scope="col">Last meaningful update</th><th scope="col">Links</th></tr></thead>
         <tbody id="tasks"></tbody>
       </table>
+      <section id="recent-landed-section" hidden>
+        <div class="section-head"><h2>Recent merged / landed</h2><span>Only completion records with explicit merge evidence</span></div>
+        <table class="fleet-table">
+          <caption>Recent merged or landed work</caption>
+          <colgroup><col class="col-status"><col class="col-task"><col class="col-project"><col class="col-runtime"><col class="col-elapsed"><col class="col-update"><col class="col-links"></colgroup>
+          <thead><tr><th scope="col">Status</th><th scope="col">Task</th><th scope="col">Project / kind</th><th scope="col">Runtime</th><th scope="col">Elapsed</th><th scope="col">Last meaningful update</th><th scope="col">Links</th></tr></thead>
+          <tbody id="recent-landed"></tbody>
+        </table>
+      </section>
+      <section id="recent-reports-section" hidden>
+        <div class="section-head"><h2>Recent reports / completed</h2><span>Completed scouts, report-backed work, and done records without merge evidence remain visible after teardown</span></div>
+        <table class="fleet-table">
+          <caption>Recent completed reports</caption>
+          <colgroup><col class="col-status"><col class="col-task"><col class="col-project"><col class="col-runtime"><col class="col-elapsed"><col class="col-update"><col class="col-links"></colgroup>
+          <thead><tr><th scope="col">Status</th><th scope="col">Task</th><th scope="col">Project / kind</th><th scope="col">Runtime</th><th scope="col">Elapsed</th><th scope="col">Last meaningful update</th><th scope="col">Links</th></tr></thead>
+          <tbody id="recent-reports"></tbody>
+        </table>
+      </section>
     </main>
     <footer><span id="home-id">Home —</span><span>Read-only · updates every 3 seconds</span></footer>
   </div>
   <script>
     const POLL_MS = 3000;
     const summaryOrder = [
-      ['needs_captain', 'Needs Captain'], ['working', 'Working'], ['waiting', 'Waiting'],
-      ['blocked', 'Blocked / failed'], ['done', 'Done / landed'], ['standby', 'Standing by'], ['unknown', 'Unknown / stale']
+      ['waiting_for_captain', 'Waiting for captain'], ['working', 'Working'], ['validation_running', 'Validation'],
+      ['pr_open_ci_pending', 'PR / CI pending'], ['ready_for_captain_merge', 'Ready to merge'], ['committed', 'Committed'],
+      ['paused_external', 'Paused / external'], ['blocked', 'Blocked'], ['merged_landed', 'Merged / landed'],
+      ['completed_report', 'Completed reports'], ['completed_unverified', 'Completed · unverified'],
+      ['standby', 'Standing by'], ['unknown', 'Unknown / stale']
     ];
     const tasksRoot = document.getElementById('tasks');
+    const recentLandedRoot = document.getElementById('recent-landed');
+    const recentReportsRoot = document.getElementById('recent-reports');
     const captainPanel = document.getElementById('captain-panel');
     const decisionList = document.getElementById('decision-list');
     const connectionText = document.getElementById('connection-text');
@@ -648,19 +817,31 @@ const HTML = String.raw`<!doctype html>
       row.append(stateCell, taskCell, projectCell, runtimeCell, elapsedCell, updateCell, linksCell);
       return row;
     }
+    function renderRows(root, tasks, emptyText) {
+      const rows = tasks.map(renderTask);
+      if (rows.length) {
+        root.replaceChildren(...rows);
+        return;
+      }
+      const emptyRow = el('tr', 'empty-row');
+      const emptyCell = el('td', 'empty', emptyText);
+      emptyCell.colSpan = 7;
+      emptyRow.append(emptyCell);
+      root.replaceChildren(emptyRow);
+    }
     function render(payload) {
       renderSummary(payload.counts || {});
       renderDecisions(payload.tasks || []);
-      const rows = (payload.tasks || []).map(renderTask);
-      if (rows.length) {
-        tasksRoot.replaceChildren(...rows);
-      } else {
-        const emptyRow = el('tr', 'empty-row');
-        const emptyCell = el('td', 'empty', 'No current direct reports or recent landed work.');
-        emptyCell.colSpan = 7;
-        emptyRow.append(emptyCell);
-        tasksRoot.replaceChildren(emptyRow);
-      }
+      const active = (payload.tasks || []).filter((task) => !task.recently_landed && !task.recently_completed_report && !task.recently_completed_unverified);
+      const landed = payload.recent_landed || (payload.tasks || []).filter((task) => task.recently_landed);
+      const reports = payload.recent_reports || (payload.tasks || []).filter((task) => task.recently_completed_report);
+      const completed = payload.recent_completed || (payload.tasks || []).filter((task) => task.recently_completed_unverified);
+      const recentCompleted = [...reports, ...completed];
+      renderRows(tasksRoot, active, 'No active direct reports or delivery handoffs.');
+      document.getElementById('recent-landed-section').hidden = landed.length === 0;
+      document.getElementById('recent-reports-section').hidden = recentCompleted.length === 0;
+      renderRows(recentLandedRoot, landed, 'No recent merged or landed work.');
+      renderRows(recentReportsRoot, recentCompleted, 'No recent completed reports.');
       const home = payload.home || { label: 'Unknown home', id: payload.home_id || '—', diagnostic: 'Dashboard home identity is unavailable.' };
       document.getElementById('home-label').textContent = home.label || 'Unknown home';
       document.getElementById('home-code').textContent = home.id ? '· ' + home.id : '';
