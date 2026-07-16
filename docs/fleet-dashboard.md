@@ -2,7 +2,7 @@
 
 The Fleet Dashboard is a local, read-only operational view for one Firstmate home.
 A lock-owning `bin/fm-session-start.sh` run starts or reuses it and prints its loopback URL.
-Keep that URL open on a second screen to see live direct reports, open captain decisions, external or CI waits, failures, stale state, and recent landed work.
+Keep that URL open on a second screen to see live direct reports, captain decisions, delivery handoffs, external waits, failures, stale state, recent merged work, and completed reports.
 
 ## Operating boundary
 
@@ -31,10 +31,13 @@ Registered secondmate summaries still use the fleet snapshot's existing validate
 
 ## State and freshness
 
-The dashboard presents `Needs Captain`, `Working`, `Waiting on CI / external`, `Blocked / failed`, `Done / landed`, `Standing by`, and `Unknown / stale`.
-An unresolved keyed `needs-decision` event takes precedence and pins the task to the top with its bounded question.
+The server's derived display classifier is the single owner of lifecycle labels and precedence.
+It reads the existing snapshot and status history without rewriting either, so dashboard presentation cannot change fleet state.
+Meaningful lifecycle events such as a captain decision, block, pause, or ship completion stage outrank stale pane or shell activity.
+An unresolved keyed `needs-decision` event pins the task to the top with its bounded question.
 Secondmate rows use validated structured state from the registered secondmate home when available, with the parent event remaining historical evidence only.
-Recent structured `Done` backlog entries stay visible after their direct-report metadata is safely torn down.
+Only backlog entries with explicit merge evidence appear under Recent merged / landed.
+Completed scouts and report-backed work remain under Recent reports / completed after their direct-report metadata is safely torn down.
 
 The browser polls every three seconds while it is open.
 The server pauses expensive fleet snapshots after a bounded span with no API client activity and starts a refresh immediately when a browser reconnects.
