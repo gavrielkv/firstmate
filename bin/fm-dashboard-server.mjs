@@ -266,10 +266,6 @@ function shipStage(task, detail) {
 function classifyTask(task, mate, decisions) {
   const event = task.paths?.status_log?.last_event?.state || '';
   const detail = lifecycleText(task);
-  if (event === 'needs-decision' || decisions.some((decision) => decision.verb === 'needs-decision')) return 'waiting_for_captain';
-  if (event === 'blocked' || event === 'failed' || decisions.some((decision) => decision.verb === 'blocked')) return 'blocked';
-  if (event === 'paused') return 'paused_external';
-  if (event === 'done') return task.kind === 'scout' ? 'completed_report' : shipStage(task, detail);
   if (mate) {
     if (mate.current?.state === 'captain_decision') return 'waiting_for_captain';
     if (mate.current?.state === 'active_child_work') return 'working';
@@ -277,6 +273,10 @@ function classifyTask(task, mate, decisions) {
     if (mate.current?.state === 'no_active_work') return 'standby';
     return 'unknown';
   }
+  if (event === 'needs-decision' || decisions.some((decision) => decision.verb === 'needs-decision')) return 'waiting_for_captain';
+  if (event === 'blocked' || event === 'failed' || decisions.some((decision) => decision.verb === 'blocked')) return 'blocked';
+  if (event === 'paused') return 'paused_external';
+  if (event === 'done') return task.kind === 'scout' ? 'completed_report' : shipStage(task, detail);
   const current = task.current_state?.state || 'unknown';
   if (current === 'failed' || current === 'blocked') return 'blocked';
   if (current === 'done') return task.kind === 'scout' ? 'completed_report' : shipStage(task, detail);
@@ -379,14 +379,28 @@ function projectTask(task, snapshot, home, now) {
   };
 }
 
+function landedDelivery(record) {
+  if (record.completion?.verb === 'merged' || Boolean(record.merged)) {
+    return { verb: 'merged', date: record.completion?.date || record.merged, note: '' };
+  }
+  if (record.completion?.verb === 'done' && record.local_note) {
+    return { verb: 'landed', date: record.completion?.date || record.done, note: record.local_note };
+  }
+  return null;
+}
+
 function projectMergedDelivery(record, liveIds, now) {
   const id = safeId(record.id);
-  if (!id || liveIds.has(id) || !record.structured || record.state !== 'done' || record.completion?.verb !== 'merged') return null;
-  const completed = parseDate(record.completion?.date || record.merged || record.reported || record.done);
+  const landed = landedDelivery(record);
+  if (!id || liveIds.has(id) || !record.structured || record.state !== 'done' || !landed) return null;
+  const completed = parseDate(landed.date || record.reported || record.done);
   const links = uniqueLinks([
     safeLink(record.pr_url),
     ...(record.links || []).map((url) => safeLink(url)),
   ]);
+  const detailText = landed.verb === 'merged'
+    ? `merged ${landed.date || ''}`
+    : `landed ${[landed.note, landed.date].filter(Boolean).join(' ')}`;
   return {
     id,
     title: redactText(record.title || id, 140),
@@ -402,7 +416,7 @@ function projectMergedDelivery(record, liveIds, now) {
       key: 'merged_landed',
       label: STATE_LABELS.merged_landed,
       source: 'backlog',
-      detail: redactText(`merged ${record.completion?.date || ''}`.trim(), 120),
+      detail: redactText(detailText.trim(), 120),
       stale: false,
     },
     decisions: [],
