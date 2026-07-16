@@ -162,7 +162,7 @@ EOF
     "window=firstmate:fm-domain-mate" "worktree=$mate" "project=$mate" \
     "harness=codex" "model=default" "effort=high" "kind=secondmate" "mode=secondmate" \
     "home=$mate" "projects=alpha"
-  printf 'working: old parent event should not override structured idle state\n' > "$home/state/domain-mate.status"
+  printf 'done: an ambiguous routed subtask finished; structured idle state must still win\n' > "$home/state/domain-mate.status"
 }
 
 http_get() {  # <url> [host]
@@ -368,6 +368,7 @@ test_truthful_lifecycle_incidents() {
 ## Done
 - [x] eating-reorder-readonly-diagnostic-f6 - Read-only Eating Reorder diagnostic data/eating-reorder-readonly-diagnostic-f6/report.md (repo: eating-reorder-app) (kind: scout) (reported 2026-07-16)
 - [x] merged-lifecycle - Merged lifecycle change https://github.com/kunchenguid/firstmate/pull/987 (repo: firstmate) (kind: ship) (merged 2026-07-16)
+- [x] local-only-landed - Local-only landing local main (repo: firstmate) (kind: ship) (done 2026-07-16)
 EOF
   printf '# completed diagnostic\n' > "$home/data/eating-reorder-readonly-diagnostic-f6/report.md"
   fm_write_meta "$home/state/implement-app-onboarding-completion-m4.meta" \
@@ -418,12 +419,15 @@ EOF
       and (.tasks[] | select(.id == "paused-lifecycle") | .state.key == "paused_external")
       and (.tasks[] | select(.id == "eating-reorder-readonly-diagnostic-f6") | .state.key == "completed_report" and .recently_landed == false)
       and (.recent_landed[] | select(.id == "merged-lifecycle") | .state.key == "merged_landed")
+      and (.recent_landed[] | select(.id == "local-only-landed") | .state.key == "merged_landed" and .recently_landed == true)
       and ([.recent_reports[].id] | index("eating-reorder-readonly-diagnostic-f6"))') \
     || fail "truthful lifecycle classification did not cover the incident states"
   printf '%s' "$api" | jq -e '
     (.tasks[] | select(.id == "implement-app-onboarding-completion-m4") | .state.source == "pane")
       and (.tasks[] | select(.id == "add-shadow-lifecycle-client-a2") | .state.label != "Merged / landed")
       and (.tasks[] | select(.id == "eating-reorder-readonly-diagnostic-f6") | .state.label != "Merged / landed")
+      and (.recent_landed[] | select(.id == "merged-lifecycle") | .state.detail | test("^merged"))
+      and (.recent_landed[] | select(.id == "local-only-landed") | .state.detail | test("^landed local main") and (test("merged") | not))
   ' >/dev/null || fail "explicit lifecycle status did not outrank stale runtime or terminology was inaccurate: $api"
   rm -f "$home/state/eating-reorder-readonly-diagnostic-f6.meta"
   api=$(wait_for_api "$url" '

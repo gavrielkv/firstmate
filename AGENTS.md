@@ -109,6 +109,7 @@ state/               volatile runtime signals; gitignored
 ```
 
 A `state/<id>.status` line is a wake event, not current-state truth; `bin/fm-crew-state.sh` owns current-state reconciliation.
+The local read-only Fleet Dashboard's lifecycle artifacts under `state/` are owned by `bin/fm-dashboard.sh`.
 Treat `data/captain.md` as the canonical portable record of captain preferences and `data/learnings.md` as curated fleet-local knowledge, regardless of harness memory.
 
 ## 3. Session start (run once at every session start)
@@ -144,6 +145,7 @@ Bootstrap detects first, asks for consent, and installs only after the captain a
 Do not dispatch until the required tools are present and GitHub authentication is good.
 Use `gh-axi` for GitHub, `chrome-devtools-axi` for browser work, and `lavish-axi` for structured decisions or reports; consult current help rather than memorizing flags.
 A silent bootstrap section needs no action; for any printed diagnostic or capability line, load `bootstrap-diagnostics` and follow its owner procedure.
+When locked, the digest also starts or reuses the local read-only Fleet Dashboard and prints its loopback URL; `bin/fm-dashboard.sh` owns its lifecycle.
 `secondmate-provisioning` owns startup secondmate sync, liveness, and inherited-config convergence.
 
 ## 4. Harness and runtime dispatch
