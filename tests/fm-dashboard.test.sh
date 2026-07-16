@@ -79,6 +79,7 @@ case "${1:-}" in
     fi
     case "$target" in
       *working-task*|*ci-task*|*slow-task*) printf 'work in progress\nesc to interrupt\n' ;;
+      *onboarding-review*) printf 'stale shell still looks busy\nesc to interrupt\n' ;;
       *needs-task*)
         if [ -e "$FM_DASHBOARD_TEST_MODE/needs-busy" ]; then
           printf 'work resumed\nesc to interrupt\n'
@@ -268,23 +269,26 @@ test_lifecycle_projection_isolation_and_live_update() {
       and .home.label == "main-home"
       and .home.selection == "explicit"
       and .home.diagnostic == null
-      and .counts.needs_captain == 1
+      and .counts.waiting_for_captain == 1
       and .counts.working == 1
-      and .counts.waiting == 2
+      and .counts.validation_running == 1
+      and .counts.paused_external == 1
       and .counts.blocked == 1
       and .counts.unknown == 1
       and .counts.standby == 1
-      and .counts.done == 2
+      and .counts.merged_landed == 1
+      and .counts.completed_report == 1
       and .tasks[0].id == "needs-task"
       and (.tasks[] | select(.id == "needs-task")
-        | .state.key == "needs_captain"
+        | .state.key == "waiting_for_captain"
           and .harness == "codex" and .model == "gpt-test" and .effort == "high"
           and .project == "needs"
           and .decisions[0].question == "choose A or B token=[REDACTED] http://127.0.0.1:4387/session/review"
           and (.links | any(.kind == "pr"))
           and (.links | any(.kind == "lavish")))
       and (.tasks[] | select(.id == "domain-mate") | .state.key == "standby")
-      and (.tasks[] | select(.id == "landed-task") | .recently_landed == true and .state.key == "done")
+      and (.tasks[] | select(.id == "landed-task") | .recently_landed == true and .state.key == "merged_landed")
+      and (.tasks[] | select(.id == "done-live") | .recently_completed_report == true and .state.key == "completed_report")
   ' >/dev/null || fail "state mapping, pinned decision, runtime fields, links, or landed projection was wrong: $api"
   assert_not_contains "$api" "$home" "API leaked the active home path"
   assert_not_contains "$api" "$other" "API leaked another home path"
@@ -313,7 +317,7 @@ test_lifecycle_projection_isolation_and_live_update() {
 
   printf 'resolved [key=choice]: use A\nworking [key=choice]: preparing the release\n' >> "$home/state/needs-task.status"
   : > "$home/needs-busy"
-  api=$(wait_for_api "$url" '(.tasks[] | select(.id == "needs-task") | .state.key == "working") and .counts.needs_captain == 0') \
+  api=$(wait_for_api "$url" '(.tasks[] | select(.id == "needs-task") | .state.key == "working") and .counts.waiting_for_captain == 0') \
     || fail "live status transition did not appear without a server restart"
   printf '%s' "$api" | jq -e '.connection.state == "live"' >/dev/null \
     || fail "connection stopped being live after status transition"
@@ -340,6 +344,99 @@ test_lifecycle_projection_isolation_and_live_update() {
     || fail "inferred-home dashboard did not stop cleanly"
   LIVE_HOMES=$(printf '%s' "$LIVE_HOMES" | sed "s# $home##")
   pass "dashboard lifecycle, projection, isolation, GET-only API, and live update are correct"
+}
+
+test_truthful_lifecycle_incidents() {
+  local home fakebin out url api
+  home=$(make_home truthful-lifecycle-incidents)
+  mkdir -p "$home/projects/onboarding" "$home/projects/shadow" "$home/projects/validation" \
+    "$home/projects/pr" "$home/projects/ready" "$home/projects/blocked" "$home/projects/paused" \
+    "$home/projects/eating" "$home/data/eating-reorder-readonly-diagnostic-f6"
+  cat > "$home/data/backlog.md" <<'EOF'
+## In flight
+- [ ] implement-app-onboarding-completion-m4 - Onboarding completion review (repo: mochi-customer-support) (kind: ship) (since 2026-07-16)
+- [ ] add-shadow-lifecycle-client-a2 - Shadow lifecycle client (repo: mochi-customer-support) (kind: ship) (since 2026-07-16)
+- [ ] validation-running - Validate lifecycle change (repo: firstmate) (kind: ship) (since 2026-07-16)
+- [ ] pr-open-ci-pending - Await CI (repo: firstmate) (kind: ship) (since 2026-07-16)
+- [ ] ready-captain-merge - Await captain merge (repo: firstmate) (kind: ship) (since 2026-07-16)
+- [ ] blocked-lifecycle - Blocked delivery (repo: firstmate) (kind: ship) (since 2026-07-16)
+- [ ] paused-lifecycle - External wait (repo: firstmate) (kind: scout) (since 2026-07-16)
+- [ ] eating-reorder-readonly-diagnostic-f6 - Read-only Eating Reorder diagnostic (repo: eating-reorder-app) (kind: scout) (since 2026-07-16)
+
+## Queued
+
+## Done
+- [x] eating-reorder-readonly-diagnostic-f6 - Read-only Eating Reorder diagnostic data/eating-reorder-readonly-diagnostic-f6/report.md (repo: eating-reorder-app) (kind: scout) (reported 2026-07-16)
+- [x] merged-lifecycle - Merged lifecycle change https://github.com/kunchenguid/firstmate/pull/987 (repo: firstmate) (kind: ship) (merged 2026-07-16)
+EOF
+  printf '# completed diagnostic\n' > "$home/data/eating-reorder-readonly-diagnostic-f6/report.md"
+  fm_write_meta "$home/state/implement-app-onboarding-completion-m4.meta" \
+    "window=firstmate:fm-onboarding-review" "worktree=$home/projects/onboarding" "project=mochi-customer-support" \
+    "harness=codex" "kind=ship" "mode=no-mistakes"
+  printf 'needs-decision: review findings await captain direction\n' > "$home/state/implement-app-onboarding-completion-m4.status"
+  fm_write_meta "$home/state/add-shadow-lifecycle-client-a2.meta" \
+    "window=firstmate:fm-add-shadow-lifecycle-client-a2" "worktree=$home/projects/shadow" "project=mochi-customer-support" \
+    "harness=codex" "kind=ship" "mode=no-mistakes"
+  printf 'done: committed shadow-only lifecycle client with focused validation; awaiting no-mistakes PR handoff\n' > "$home/state/add-shadow-lifecycle-client-a2.status"
+  fm_write_meta "$home/state/validation-running.meta" \
+    "window=firstmate:fm-validation-running" "worktree=$home/projects/validation" "project=firstmate" \
+    "harness=codex" "kind=ship" "mode=no-mistakes"
+  printf 'working: no-mistakes validation and CI checks running\n' > "$home/state/validation-running.status"
+  fm_write_meta "$home/state/pr-open-ci-pending.meta" \
+    "window=firstmate:fm-pr-open-ci-pending" "worktree=$home/projects/pr" "project=firstmate" \
+    "harness=codex" "kind=ship" "mode=no-mistakes" "pr=https://github.com/kunchenguid/firstmate/pull/988"
+  printf 'working: pull request opened; CI checks pending\n' > "$home/state/pr-open-ci-pending.status"
+  fm_write_meta "$home/state/ready-captain-merge.meta" \
+    "window=firstmate:fm-ready-captain-merge" "worktree=$home/projects/ready" "project=firstmate" \
+    "harness=codex" "kind=ship" "mode=no-mistakes" "pr=https://github.com/kunchenguid/firstmate/pull/989"
+  printf 'done: PR checks green; awaiting captain merge\n' > "$home/state/ready-captain-merge.status"
+  fm_write_meta "$home/state/blocked-lifecycle.meta" \
+    "window=firstmate:fm-blocked-lifecycle" "worktree=$home/projects/blocked" "project=firstmate" \
+    "harness=codex" "kind=ship" "mode=no-mistakes"
+  printf 'blocked: required credential is unavailable\n' > "$home/state/blocked-lifecycle.status"
+  fm_write_meta "$home/state/paused-lifecycle.meta" \
+    "window=firstmate:fm-paused-lifecycle" "worktree=$home/projects/paused" "project=firstmate" \
+    "harness=codex" "kind=scout" "mode=scout"
+  printf 'paused: waiting for an upstream release window\n' > "$home/state/paused-lifecycle.status"
+  fm_write_meta "$home/state/eating-reorder-readonly-diagnostic-f6.meta" \
+    "window=firstmate:fm-eating-reorder-readonly-diagnostic-f6" "worktree=$home/projects/eating" "project=eating-reorder-app" \
+    "harness=codex" "kind=scout" "mode=scout"
+  printf 'done: completed read-only diagnostic report\n' > "$home/state/eating-reorder-readonly-diagnostic-f6.status"
+  fakebin=$(make_fakebin "$home")
+  out=$(start_fixture_dashboard "$home" "$fakebin" "$((BASE_PORT + 90))") \
+    || fail "truthful lifecycle fixture dashboard start failed: $out"
+  url=${out##* }
+  LIVE_HOMES="$LIVE_HOMES $home"
+  api=$(wait_for_api "$url" '
+    .connection.state == "live"
+      and (.tasks[] | select(.id == "implement-app-onboarding-completion-m4") | .state.key == "waiting_for_captain")
+      and (.tasks[] | select(.id == "add-shadow-lifecycle-client-a2") | .state.key == "committed")
+      and (.tasks[] | select(.id == "validation-running") | .state.key == "validation_running")
+      and (.tasks[] | select(.id == "pr-open-ci-pending") | .state.key == "pr_open_ci_pending")
+      and (.tasks[] | select(.id == "ready-captain-merge") | .state.key == "ready_for_captain_merge")
+      and (.tasks[] | select(.id == "blocked-lifecycle") | .state.key == "blocked")
+      and (.tasks[] | select(.id == "paused-lifecycle") | .state.key == "paused_external")
+      and (.tasks[] | select(.id == "eating-reorder-readonly-diagnostic-f6") | .state.key == "completed_report" and .recently_landed == false)
+      and (.recent_landed[] | select(.id == "merged-lifecycle") | .state.key == "merged_landed")
+      and ([.recent_reports[].id] | index("eating-reorder-readonly-diagnostic-f6"))') \
+    || fail "truthful lifecycle classification did not cover the incident states"
+  printf '%s' "$api" | jq -e '
+    (.tasks[] | select(.id == "implement-app-onboarding-completion-m4") | .state.source == "pane")
+      and (.tasks[] | select(.id == "add-shadow-lifecycle-client-a2") | .state.label != "Merged / landed")
+      and (.tasks[] | select(.id == "eating-reorder-readonly-diagnostic-f6") | .state.label != "Merged / landed")
+  ' >/dev/null || fail "explicit lifecycle status did not outrank stale runtime or terminology was inaccurate: $api"
+  rm -f "$home/state/eating-reorder-readonly-diagnostic-f6.meta"
+  api=$(wait_for_api "$url" '
+    ([.tasks[].id] | index("eating-reorder-readonly-diagnostic-f6")) != null
+      and (.recent_reports[] | select(.id == "eating-reorder-readonly-diagnostic-f6") | .state.key == "completed_report" and .state.source == "backlog")') \
+    || fail "completed report disappeared after its live metadata was removed"
+  html=$(http_get "$url/") || fail "truthful lifecycle dashboard HTML failed"
+  assert_contains "$html" "Recent reports / completed" "dashboard omitted dedicated completed-report section"
+  assert_contains "$html" "Ready to merge" "dashboard omitted explicit merge-handoff terminology"
+  PATH="$fakebin:$PATH" FM_HOME="$home" "$DASHBOARD" stop >/dev/null \
+    || fail "truthful lifecycle fixture dashboard did not stop cleanly"
+  LIVE_HOMES=$(printf '%s' "$LIVE_HOMES" | sed "s# $home##")
+  pass "dashboard preserves truthful lifecycle stages and completed reports"
 }
 
 test_collision_fallback_and_safe_ambiguous_stop() {
@@ -488,5 +585,6 @@ SH
 
 test_help_and_internal_contract
 test_lifecycle_projection_isolation_and_live_update
+test_truthful_lifecycle_incidents
 test_collision_fallback_and_safe_ambiguous_stop
 test_slow_task_retained_cache_idle_reconnect_and_disabled_open
