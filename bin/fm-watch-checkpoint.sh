@@ -4,7 +4,7 @@
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SECONDS_ARG=${FM_CODEX_WATCH_CHECKPOINT:-180}
+SECONDS_ARG=${FM_CODEX_WATCH_CHECKPOINT:-600}
 
 usage() {
   cat <<'EOF'

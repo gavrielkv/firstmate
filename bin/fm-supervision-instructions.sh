@@ -86,7 +86,7 @@ case "$HARNESS" in
 esac
 [ -f "$SNIPPET" ] || SNIPPET="$DOC_DIR/unknown.md"
 
-checkpoint_seconds=${FM_CODEX_WATCH_CHECKPOINT:-180}
+checkpoint_seconds=${FM_CODEX_WATCH_CHECKPOINT:-600}
 pi_ext="$FM_ROOT/.pi/extensions/fm-primary-pi-watch.ts"
 pi_turnend_ext="$FM_ROOT/.pi/extensions/fm-primary-turnend-guard.ts"
 x_mode_env="$CONFIG/x-mode.env"
